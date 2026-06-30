@@ -10,7 +10,11 @@ from app import (
     ATSParser,
     UniversalCandidate,
     CandidateSkill,
-    WorkExperience
+    WorkExperience,
+    get_country_iso,
+    clean_date_to_yyyy_mm,
+    ConfidenceScorer,
+    ProjectInfo
 )
 
 client = TestClient(app)
@@ -125,8 +129,8 @@ def test_transform_api():
     assert "provenance" in cand
     
     canonical = cand["canonical_json"]
-    assert canonical["personal_info"]["full_name"] == "Jane Doe"
-    assert "jane@lever.io" in canonical["personal_info"]["emails"]
+    assert canonical["full_name"] == "Jane Doe"
+    assert "jane@lever.io" in canonical["emails"]
     
     skills_names = [s["name"] for s in canonical["skills"]]
     assert "React" in skills_names
@@ -201,3 +205,87 @@ def test_dictionary_skills_and_personal_info_unwrapping():
     assert "JS" in skills_names
     assert "programmingLanguages" not in skills_names
     assert "webTechnologies" not in skills_names
+
+def test_new_features():
+    # 1. Test country mapping
+    assert get_country_iso("India") == "IN"
+    assert get_country_iso("United States") == "US"
+    assert get_country_iso("USA") == "US"
+    
+    # 2. Test date cleaning
+    assert clean_date_to_yyyy_mm("June 2021") == "2021-06"
+    assert clean_date_to_yyyy_mm("Present") == "Present"
+    
+    # 3. Test skill confidence cross-referencing
+    cand = UniversalCandidate()
+    cand.personal_info.links = ["https://github.com/testuser"]
+    cand.skills = [
+        CandidateSkill(name="Java", original_name="Java", sources=["resume_pdf"]),
+        CandidateSkill(name="Python", original_name="Python", sources=["resume_pdf"])
+    ]
+    # Python is verified, Java is not
+    cand.projects = [
+        ProjectInfo(name="Python App", technologies=["Python"])
+    ]
+    
+    scores, overall = ConfidenceScorer.calculate(cand)
+    
+    # Java should be penalized (base 0.75 * 0.5 = 0.38)
+    java_skill = [s for s in cand.skills if s.name == "Java"][0]
+    assert java_skill.confidence == 0.38
+    assert "Penalty" in java_skill.confidence_explanation
+    
+    # Python should be boosted (base 0.75 + 0.1 = 0.85)
+    python_skill = [s for s in cand.skills if s.name == "Python"][0]
+    assert python_skill.confidence == 0.85
+    assert "Boost" in python_skill.confidence_explanation
+
+def test_transform_keeps_distinct_uploaded_profiles():
+    ats_content = json.dumps({
+        "name": "KESAVARDHINI C",
+        "email": "kesavardhini@example.com",
+        "skills": ["C", "C++", "Java"]
+    })
+    notes_text = """
+Naveen Raj K
+Email: naveen@example.com
+Phone: +917511199896
+Skills
+Python, Java, React
+Education
+Bachelor of Engineering, Anna University, 2024
+---
+KESAVARDHINI C
+Email: kesavardhini@example.com
+Phone: +919342366267
+Skills
+C, C++, Java
+Education
+Bachelor of Technology, Karpagam College, 2027
+"""
+
+    files = {
+        "ats_json": ("skill_kesavardhini.json", ats_content, "application/json"),
+    }
+    config = {
+        "include_confidence": True,
+        "include_provenance": True,
+        "normalize_skills": True,
+        "missing_values": "null",
+        "selected_fields": ["full_name", "emails", "phones", "skills", "education"]
+    }
+
+    response = client.post(
+        "/transform",
+        files=files,
+        data={"config": json.dumps(config), "recruiter_notes_str": notes_text}
+    )
+    if response.status_code != 200:
+        print("API ERROR DETAILS:", response.text)
+    assert response.status_code == 200
+
+    payload = response.json()
+    names = {c["canonical_json"].get("full_name") for c in payload["candidates"]}
+    assert payload["batch_metadata"]["total_candidates"] == 2
+    assert "Naveen Raj K" in names
+    assert "KESAVARDHINI C" in names

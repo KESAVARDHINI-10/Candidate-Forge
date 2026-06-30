@@ -364,6 +364,81 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const asArray = (value) => {
+    if (Array.isArray(value)) return value.filter(Boolean);
+    return value ? [value] : [];
+  };
+
+  const flattenValues = (value) => {
+    if (!value) return [];
+    if (Array.isArray(value)) return value.flatMap(flattenValues);
+    if (typeof value === 'object') return Object.values(value).flatMap(flattenValues);
+    return [String(value)];
+  };
+
+  const formatValue = (value) => flattenValues(value).join(', ');
+
+  const normalizeSkill = (skill) => {
+    if (typeof skill === 'string') {
+      return { name: skill, confidence: 1 };
+    }
+    return {
+      ...skill,
+      name: skill?.name || skill?.skill || 'Unnamed skill',
+      confidence: Number.isFinite(skill?.confidence) ? skill.confidence : 1
+    };
+  };
+
+  const normalizeExperience = (experience) => ({
+    ...experience,
+    role: experience?.role || experience?.title || '',
+    company: experience?.company || '',
+    start_date: experience?.start_date || experience?.start || '',
+    end_date: experience?.end_date || experience?.end || '',
+    description: experience?.description || experience?.summary || ''
+  });
+
+  const normalizeEducation = (education) => ({
+    ...education,
+    institution: education?.institution || education?.school || '',
+    degree: education?.degree || '',
+    major: education?.major || education?.field || '',
+    graduation_date: education?.graduation_date || education?.end_year || education?.end || ''
+  });
+
+  const normalizeProject = (project) => ({
+    ...project,
+    name: project?.name || project?.title || '',
+    description: project?.description || project?.summary || '',
+    technologies: asArray(project?.technologies),
+    url: project?.url || project?.link || ''
+  });
+
+  const normalizeCandidateView = (candidate) => {
+    const json = candidate?.canonical_json || {};
+    const personal = json.personal_info || {};
+
+    return {
+      full_name: personal.full_name || json.full_name || json.name || candidate?.candidate_name || '',
+      headline: personal.headline || json.headline || '',
+      emails: asArray(personal.emails || json.emails),
+      phones: asArray(personal.phones || json.phones),
+      location: formatValue(personal.location || json.location),
+      links: flattenValues(personal.links || json.links),
+      skills: asArray(json.skills).map(normalizeSkill).slice(0, 80),
+      experience: asArray(json.experience).map(normalizeExperience).slice(0, 40),
+      education: asArray(json.education).map(normalizeEducation).slice(0, 40),
+      projects: asArray(json.projects).map(normalizeProject).slice(0, 40)
+    };
+  };
+
+  const selectedCandidate = transformResult?.candidates?.[selectedCandidateIndex] || null;
+  const selectedJson = selectedCandidate?.canonical_json || {};
+  const selectedProfile = normalizeCandidateView(selectedCandidate);
+  const selectedTrust = selectedCandidate?.trust_analysis || null;
+  const trustSections = Object.entries(selectedTrust?.section_scores || {});
+  const formatPercent = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
+  const formatLabel = (value) => String(value || '').replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
   const renderHighlightedJson = () => {
     if (!transformResult || !transformResult.candidates[selectedCandidateIndex]) return null;
     const json = transformResult.candidates[selectedCandidateIndex].canonical_json;
@@ -1171,6 +1246,140 @@ export default function App() {
               </div>
             </div>
 
+            {/* Trust Analysis */}
+            {selectedTrust && (
+              <section className={`border rounded-card p-6 space-y-6 ${
+                darkMode ? 'bg-[#121826] border-slate-800' : 'bg-white border-slate-200 shadow-md'
+              }`}>
+                <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-5">
+                  <div className="space-y-2 max-w-3xl">
+                    <div className="flex items-center gap-2">
+                      <Info size={18} className="text-blue-500" />
+                      <h3 className="font-bold text-lg">AI Candidate Trust Analysis</h3>
+                    </div>
+                    <p className={`text-sm leading-6 ${darkMode ? 'text-gray-300' : 'text-slate-600'}`}>
+                      {selectedTrust.candidate_summary}
+                    </p>
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <span className="px-2.5 py-1 rounded-lg bg-blue-500/10 text-blue-400 text-xs font-mono">
+                        Source: {selectedTrust.most_reliable_source || 'N/A'}
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-800/70 text-gray-300 text-xs font-mono">
+                        Conflict Ratio: {formatPercent(selectedTrust.ratios?.conflict_ratio)}
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-800/70 text-gray-300 text-xs font-mono">
+                        Missing Ratio: {formatPercent(selectedTrust.ratios?.missing_information_ratio)}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-3 min-w-full lg:min-w-[390px]">
+                    <div className="border border-slate-800 rounded-card p-3 bg-slate-950/30">
+                      <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold">Trust</div>
+                      <div className="text-2xl font-black text-blue-400 font-mono mt-1">{formatPercent(selectedTrust.overall_trust_score)}</div>
+                    </div>
+                    <div className="border border-slate-800 rounded-card p-3 bg-slate-950/30">
+                      <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold">Match</div>
+                      <div className="text-2xl font-black text-emerald-400 font-mono mt-1">{formatPercent(selectedTrust.overall_match_score)}</div>
+                    </div>
+                    <div className="border border-slate-800 rounded-card p-3 bg-slate-950/30">
+                      <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold">Action</div>
+                      <div className={`text-sm font-black mt-2 ${
+                        selectedTrust.recommendation === 'Recommended' ? 'text-emerald-400' :
+                        selectedTrust.recommendation === 'Needs Review' ? 'text-amber-400' : 'text-red-400'
+                      }`}>
+                        {selectedTrust.recommendation}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+                  <div className="xl:col-span-2 space-y-3">
+                    <h4 className="text-xs uppercase tracking-wider font-semibold text-blue-500">Section Confidence Formula</h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {trustSections.map(([section, data]) => (
+                        <div key={section} className="border border-slate-800 rounded-card p-4 bg-slate-950/25 space-y-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-sm font-bold">{formatLabel(section)}</span>
+                            <span className="font-mono text-blue-400 font-bold">{formatPercent(data.score)}</span>
+                          </div>
+                          <div className="w-full bg-slate-800 rounded-full h-1.5">
+                            <div className="h-1.5 rounded-full bg-blue-500" style={{ width: formatPercent(data.score) }} />
+                          </div>
+                          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] font-mono text-gray-400">
+                            <span>Reliability {formatPercent(data.source_reliability)}</span>
+                            <span>Agreement {formatPercent(data.source_agreement_ratio)}</span>
+                            <span>Freshness {formatPercent(data.freshness_score)}</span>
+                            <span>Completeness {formatPercent(data.completeness_ratio)}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="border border-slate-800 rounded-card p-4 bg-slate-950/25">
+                      <h4 className="text-xs uppercase tracking-wider font-semibold text-emerald-400 mb-3">Strengths</h4>
+                      <div className="space-y-2">
+                        {(selectedTrust.strengths || []).map((item, idx) => (
+                          <div key={idx} className="flex gap-2 text-xs text-gray-300 leading-5">
+                            <CheckCircle size={13} className="text-emerald-400 mt-0.5 shrink-0" />
+                            <span>{item}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="border border-slate-800 rounded-card p-4 bg-slate-950/25">
+                      <h4 className="text-xs uppercase tracking-wider font-semibold text-amber-400 mb-3">Risks & Review Points</h4>
+                      <div className="space-y-2">
+                        {(selectedTrust.risks || []).map((item, idx) => (
+                          <div key={idx} className="flex gap-2 text-xs text-gray-300 leading-5">
+                            <AlertTriangle size={13} className="text-amber-400 mt-0.5 shrink-0" />
+                            <span>{item}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                  <div className="border border-slate-800 rounded-card p-4 bg-slate-950/25">
+                    <h4 className="text-xs uppercase tracking-wider font-semibold text-blue-500 mb-3">Source Reliability</h4>
+                    <div className="space-y-2">
+                      {Object.entries(selectedTrust.source_reliability_scores || {}).map(([source, score]) => (
+                        <div key={source} className="flex items-center justify-between gap-4 text-xs font-mono">
+                          <span className="text-gray-300 truncate">{source}</span>
+                          <span className="text-blue-400 font-bold">{formatPercent(score)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="border border-slate-800 rounded-card p-4 bg-slate-950/25">
+                    <h4 className="text-xs uppercase tracking-wider font-semibold text-blue-500 mb-3">Missing & Conflicting Information</h4>
+                    <div className="space-y-2 max-h-36 overflow-y-auto pr-1">
+                      {(selectedTrust.missing_information || []).slice(0, 6).map((item, idx) => (
+                        <div key={`missing-${idx}`} className="text-xs text-gray-400 font-mono">Missing: {item}</div>
+                      ))}
+                      {(selectedTrust.inconsistencies || []).slice(0, 4).map((item, idx) => (
+                        <div key={`conflict-${idx}`} className="text-xs text-amber-300 font-mono">
+                          Conflict: {item.field_name} resolved by {item.resolution_method}
+                        </div>
+                      ))}
+                      {(!selectedTrust.missing_information?.length && !selectedTrust.inconsistencies?.length) && (
+                        <div className="text-xs text-gray-400">No missing or conflicting information detected.</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="text-[11px] text-gray-500 font-mono border-t border-slate-800 pt-3">
+                  {selectedTrust.scoring_notes?.section_formula}. Freshness uses {selectedTrust.scoring_notes?.freshness_formula}.
+                </div>
+              </section>
+            )}
             {/* Runtime Output Configuration */}
             <div className={`border rounded-card overflow-hidden ${
               darkMode ? 'border-slate-800 bg-[#121826]' : 'border-slate-200 bg-white shadow-sm'
@@ -1412,28 +1621,28 @@ export default function App() {
                     <tbody>
                       <tr className="border-b border-slate-800/50">
                         <td className="py-2.5 font-bold w-1/4 text-gray-400">Full Name</td>
-                        <td className="py-2.5 text-white">{transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.full_name || 'N/A'}</td>
+                        <td className="py-2.5 text-white">{selectedProfile.full_name || 'N/A'}</td>
                       </tr>
                       <tr className="border-b border-slate-800/50">
                         <td className="py-2.5 font-bold text-gray-400">Headline</td>
-                        <td className="py-2.5 text-white">{transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.headline || 'N/A'}</td>
+                        <td className="py-2.5 text-white">{selectedProfile.headline || 'N/A'}</td>
                       </tr>
                       <tr className="border-b border-slate-800/50">
                         <td className="py-2.5 font-bold text-gray-400">Emails</td>
-                        <td className="py-2.5 text-white">{transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.emails?.join(', ') || 'N/A'}</td>
+                        <td className="py-2.5 text-white">{selectedProfile.emails?.join(', ') || 'N/A'}</td>
                       </tr>
                       <tr className="border-b border-slate-800/50">
                         <td className="py-2.5 font-bold text-gray-400">Phones</td>
-                        <td className="py-2.5 text-white">{transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.phones?.join(', ') || 'N/A'}</td>
+                        <td className="py-2.5 text-white">{selectedProfile.phones?.join(', ') || 'N/A'}</td>
                       </tr>
                       <tr className="border-b border-slate-800/50">
                         <td className="py-2.5 font-bold text-gray-400">Location</td>
-                        <td className="py-2.5 text-white">{transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.location || 'N/A'}</td>
+                        <td className="py-2.5 text-white">{selectedProfile.location || 'N/A'}</td>
                       </tr>
                       <tr className="border-b border-slate-800/50">
                         <td className="py-2.5 font-bold text-gray-400">Links</td>
                         <td className="py-2.5 text-white">
-                          {transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.links?.map((l, i) => (
+                          {selectedProfile.links?.map((l, i) => (
                             <a key={i} href={l} target="_blank" rel="noreferrer" className="text-blue-400 hover:underline mr-3 font-sans block sm:inline">
                               {l}
                             </a>
@@ -1447,9 +1656,9 @@ export default function App() {
                 {/* Skills Tabular */}
                 <div className="space-y-4 pt-4">
                   <h3 className="text-base font-bold text-blue-500 border-b border-slate-800 pb-2">Skills</h3>
-                  {transformResult.candidates[selectedCandidateIndex].canonical_json.skills?.length > 0 ? (
+                  {selectedProfile.skills?.length > 0 ? (
                     <div className="flex flex-wrap gap-2">
-                      {transformResult.candidates[selectedCandidateIndex].canonical_json.skills.map((s, idx) => (
+                      {selectedProfile.skills.map((s, idx) => (
                         <div key={idx} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/70 border border-slate-700 rounded-lg text-xs">
                           <span className="font-semibold text-white">{s.name}</span>
                           <span className="text-[10px] text-blue-400 font-mono bg-blue-500/10 px-1.5 py-0.5 rounded">{(s.confidence * 100).toFixed(0)}%</span>
@@ -1464,7 +1673,7 @@ export default function App() {
                 {/* Experience Tabular */}
                 <div className="space-y-4 pt-4">
                   <h3 className="text-base font-bold text-blue-500 border-b border-slate-800 pb-2">Work Experience</h3>
-                  {transformResult.candidates[selectedCandidateIndex].canonical_json.experience?.length > 0 ? (
+                  {selectedProfile.experience?.length > 0 ? (
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm text-left border-collapse">
                         <thead>
@@ -1476,7 +1685,7 @@ export default function App() {
                           </tr>
                         </thead>
                         <tbody>
-                          {transformResult.candidates[selectedCandidateIndex].canonical_json.experience.map((exp, idx) => (
+                          {selectedProfile.experience.map((exp, idx) => (
                             <tr key={idx} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-all">
                               <td className="py-3 font-semibold text-white pr-2 align-top">{exp.role || 'N/A'}</td>
                               <td className="py-3 text-gray-300 pr-2 align-top">{exp.company || 'N/A'}</td>
@@ -1497,7 +1706,7 @@ export default function App() {
                 {/* Education Tabular */}
                 <div className="space-y-4 pt-4">
                   <h3 className="text-base font-bold text-blue-500 border-b border-slate-800 pb-2">Education</h3>
-                  {transformResult.candidates[selectedCandidateIndex].canonical_json.education?.length > 0 ? (
+                  {selectedProfile.education?.length > 0 ? (
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm text-left border-collapse">
                         <thead>
@@ -1509,7 +1718,7 @@ export default function App() {
                           </tr>
                         </thead>
                         <tbody>
-                          {transformResult.candidates[selectedCandidateIndex].canonical_json.education.map((edu, idx) => (
+                          {selectedProfile.education.map((edu, idx) => (
                             <tr key={idx} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-all">
                               <td className="py-3 font-semibold text-white pr-2">{edu.institution || 'N/A'}</td>
                               <td className="py-3 text-gray-300 pr-2">{edu.degree || 'N/A'}</td>
@@ -1528,7 +1737,7 @@ export default function App() {
                 {/* Projects Tabular */}
                 <div className="space-y-4 pt-4">
                   <h3 className="text-base font-bold text-blue-500 border-b border-slate-800 pb-2">Projects</h3>
-                  {transformResult.candidates[selectedCandidateIndex].canonical_json.projects?.length > 0 ? (
+                  {selectedProfile.projects?.length > 0 ? (
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm text-left border-collapse">
                         <thead>
@@ -1539,7 +1748,7 @@ export default function App() {
                           </tr>
                         </thead>
                         <tbody>
-                          {transformResult.candidates[selectedCandidateIndex].canonical_json.projects.map((proj, idx) => (
+                          {selectedProfile.projects.map((proj, idx) => (
                             <tr key={idx} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-all">
                               <td className="py-3 font-semibold text-white pr-2 align-top">{proj.name || 'N/A'}</td>
                               <td className="py-3 pr-2 align-top">
@@ -1581,7 +1790,7 @@ export default function App() {
                   <div className="space-y-3 max-w-[80%] relative z-10">
                     <div className="flex items-center gap-3">
                       <h2 className="text-3xl font-extrabold tracking-tight">
-                        {transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.full_name || 'Unnamed Candidate'}
+                        {selectedProfile.full_name || 'Unnamed Candidate'}
                       </h2>
                       <button
                         onClick={() => {
@@ -1594,15 +1803,15 @@ export default function App() {
                         <RefreshCw size={10} /> Reset
                       </button>
                     </div>
-                    {transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.headline && (
+                    {selectedProfile.headline && (
                       <p className="text-lg text-blue-200 font-medium">
-                        {transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.headline}
+                        {selectedProfile.headline}
                       </p>
                     )}
-                    {transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.location && (
+                    {selectedProfile.location && (
                       <div className="flex items-center gap-1.5 text-sm text-blue-150">
                         <Globe size={14} />
-                        <span>{transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.location}</span>
+                        <span>{selectedProfile.location}</span>
                       </div>
                     )}
                   </div>
@@ -1618,19 +1827,19 @@ export default function App() {
 
                 {/* Sub-Header Contact Info strip */}
                 <div className="px-8 py-4 bg-slate-950/40 border-b border-slate-800 flex flex-wrap gap-6 text-sm text-gray-400">
-                  {transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.emails?.map((email, idx) => (
+                  {selectedProfile.emails?.map((email, idx) => (
                     <div key={idx} className="flex items-center gap-1.5 font-mono">
                       <span className="text-blue-500">✉</span>
                       <span className="text-gray-300">{email}</span>
                     </div>
                   ))}
-                  {transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.phones?.map((phone, idx) => (
+                  {selectedProfile.phones?.map((phone, idx) => (
                     <div key={idx} className="flex items-center gap-1.5 font-mono">
                       <span className="text-blue-500">📞</span>
                       <span className="text-gray-300">{phone}</span>
                     </div>
                   ))}
-                  {transformResult.candidates[selectedCandidateIndex].canonical_json.personal_info?.links?.map((link, idx) => (
+                  {selectedProfile.links?.map((link, idx) => (
                     <a key={idx} href={link} target="_blank" rel="noreferrer" className="flex items-center gap-1.5 text-blue-400 hover:underline">
                       <span>🔗</span>
                       <span className="truncate max-w-[180px]">{link}</span>
@@ -1645,9 +1854,9 @@ export default function App() {
                   <div className="space-y-6 lg:col-span-1">
                     <div>
                       <h3 className="text-xs uppercase tracking-wider font-bold text-blue-450 border-b border-slate-800 pb-2 mb-4">Core Skills</h3>
-                      {transformResult.candidates[selectedCandidateIndex].canonical_json.skills?.length > 0 ? (
+                      {selectedProfile.skills?.length > 0 ? (
                         <div className="flex flex-wrap gap-2">
-                          {transformResult.candidates[selectedCandidateIndex].canonical_json.skills.map((s, idx) => (
+                          {selectedProfile.skills.map((s, idx) => (
                             <span key={idx} className="px-3 py-1.5 bg-slate-905 border border-slate-800 rounded-xl text-xs flex items-center justify-between gap-3 w-full">
                               <span className="font-semibold text-gray-250">{s.name}</span>
                               <span className="text-[10px] font-mono text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded">
@@ -1668,9 +1877,9 @@ export default function App() {
                     {/* Experience Timeline */}
                     <div>
                       <h3 className="text-xs uppercase tracking-wider font-bold text-blue-455 border-b border-slate-800 pb-2 mb-6">Work Experience</h3>
-                      {transformResult.candidates[selectedCandidateIndex].canonical_json.experience?.length > 0 ? (
+                      {selectedProfile.experience?.length > 0 ? (
                         <div className="space-y-6 relative border-l border-slate-800 ml-2 pl-6">
-                          {transformResult.candidates[selectedCandidateIndex].canonical_json.experience.map((exp, idx) => (
+                          {selectedProfile.experience.map((exp, idx) => (
                             <div key={idx} className="relative space-y-1.5">
                               {/* Timeline dot */}
                               <div className="absolute -left-[31px] top-1 bg-blue-600 rounded-full w-2.5 h-2.5 border border-[#0f1422]" />
@@ -1698,9 +1907,9 @@ export default function App() {
                     {/* Education section */}
                     <div>
                       <h3 className="text-xs uppercase tracking-wider font-bold text-blue-455 border-b border-slate-800 pb-2 mb-4">Education</h3>
-                      {transformResult.candidates[selectedCandidateIndex].canonical_json.education?.length > 0 ? (
+                      {selectedProfile.education?.length > 0 ? (
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          {transformResult.candidates[selectedCandidateIndex].canonical_json.education.map((edu, idx) => (
+                          {selectedProfile.education.map((edu, idx) => (
                             <div key={idx} className="p-4 bg-slate-900/60 border border-slate-800/80 rounded-xl space-y-1">
                               <div className="text-xs text-blue-400 font-mono">{edu.graduation_date || 'N/A'}</div>
                               <h4 className="text-sm font-bold text-white">{edu.institution}</h4>
@@ -1718,9 +1927,9 @@ export default function App() {
                     {/* Projects section */}
                     <div>
                       <h3 className="text-xs uppercase tracking-wider font-bold text-blue-455 border-b border-slate-800 pb-2 mb-4">Featured Projects</h3>
-                      {transformResult.candidates[selectedCandidateIndex].canonical_json.projects?.length > 0 ? (
+                      {selectedProfile.projects?.length > 0 ? (
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          {transformResult.candidates[selectedCandidateIndex].canonical_json.projects.map((proj, idx) => (
+                          {selectedProfile.projects.map((proj, idx) => (
                             <div key={idx} className="p-4 bg-slate-900/60 border border-slate-800/80 rounded-xl flex flex-col justify-between h-full space-y-3">
                               <div className="space-y-1.5">
                                 <h4 className="text-sm font-bold text-white">{proj.name}</h4>

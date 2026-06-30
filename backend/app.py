@@ -4,6 +4,7 @@ import json
 import time
 import datetime
 import traceback
+import math
 import pandas as pd
 import fitz  # PyMuPDF
 import docx
@@ -14,13 +15,21 @@ import jsonschema
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
+from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from rapidfuzz import fuzz
+
+# ReportLab imports for PDF generation
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 # =====================================================================
 # 1. CONSTANTS & CONFIGURATIONS
 # =====================================================================
 
+# Weights for different sources based on their trustworthiness
 SOURCE_WEIGHTS = {
     "ats_json": 0.95,
     "recruiter_csv": 0.85,
@@ -30,11 +39,13 @@ SOURCE_WEIGHTS = {
     "github_url": 0.50
 }
 
+# Helper to get the weight of a source from its name
 def get_source_weight(src_name: str) -> float:
     if not src_name: return 0.70
     prefix = src_name.split(":", 1)[0]
     return SOURCE_WEIGHTS.get(prefix, 0.70)
 
+# Canonical list of skills for mapping and the Vector DB
 CANONICAL_SKILLS = {
     "React": ("React", "Frontend Framework"),
     "ReactJS": ("React", "Frontend Framework"),
@@ -69,9 +80,17 @@ CANONICAL_SKILLS = {
     "Git": ("Git", "DevOps"),
     "Pandas": ("Pandas", "Data Science"),
     "Numpy": ("NumPy", "Data Science"),
-    "TensorFlow": ("TensorFlow", "Machine Learning")
+    "TensorFlow": ("TensorFlow", "Machine Learning"),
+    "Java": ("Java", "Programming Language"),
+    "C++": ("C++", "Programming Language"),
+    "C#": ("C#", "Programming Language"),
+    "SQL": ("SQL", "Database"),
+    "HTML": ("HTML", "Frontend"),
+    "CSS": ("CSS", "Frontend"),
+    "Tailwind CSS": ("Tailwind CSS", "Frontend")
 }
 
+# Canonical degrees dictionary for normalization
 CANONICAL_DEGREES = {
     "BS": "Bachelor of Science",
     "B.S.": "Bachelor of Science",
@@ -93,124 +112,68 @@ CANONICAL_DEGREES = {
     "Doctor": "Doctor of Philosophy"
 }
 
-BASE_JSON_SCHEMA = {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "CanonicalCandidate",
-  "type": "object",
-  "properties": {
-    "candidate_id": { "type": "string" },
-    "personal_info": {
-      "type": "object",
-      "properties": {
-        "full_name": { "type": ["string", "null"] },
-        "headline": { "type": ["string", "null"] },
-        "emails": {
-          "type": "array",
-          "items": { "type": "string", "format": "email" }
-        },
-        "phones": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "location": { "type": ["string", "null"] },
-        "links": {
-          "type": "array",
-          "items": { "type": "string", "format": "uri" }
-        }
-      }
-    },
-    "skills": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "name": { "type": "string" },
-          "original_name": { "type": ["string", "null"] },
-          "is_canonical": { "type": "boolean" },
-          "category": { "type": ["string", "null"] },
-          "similarity_score": { "type": "number" },
-          "confidence": { "type": "number" }
-        },
-        "required": ["name"]
-      }
-    },
-    "experience": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "role": { "type": ["string", "null"] },
-          "company": { "type": ["string", "null"] },
-          "location": { "type": ["string", "null"] },
-          "start_date": { "type": ["string", "null"] },
-          "end_date": { "type": ["string", "null"] },
-          "description": { "type": ["string", "null"] },
-          "duration_months": { "type": ["integer", "null"] }
-        }
-      }
-    },
-    "education": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "degree": { "type": ["string", "null"] },
-          "institution": { "type": ["string", "null"] },
-          "major": { "type": ["string", "null"] },
-          "graduation_date": { "type": ["string", "null"] }
-        }
-      }
-    },
-    "projects": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "name": { "type": ["string", "null"] },
-          "description": { "type": ["string", "null"] },
-          "url": { "type": ["string", "null", "format", "uri"] },
-          "technologies": {
-            "type": "array",
-            "items": { "type": "string" }
-          }
-        }
-      }
-    },
-    "confidence_scores": {
-      "type": "object",
-      "properties": {
-        "overall_score": { "type": "number" },
-        "sections": {
-          "type": "object",
-          "properties": {
-            "personal_info": { "type": "number" },
-            "skills": { "type": "number" },
-            "experience": { "type": "number" },
-            "education": { "type": "number" },
-            "projects": { "type": "number" }
-          }
-        }
-      }
-    },
-    "provenance": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "object",
-        "properties": {
-          "source": { "type": "string" },
-          "method": { "type": "string" },
-          "confidence": { "type": "number" },
-          "normalization_applied": { "type": ["string", "null"] },
-          "timestamp": { "type": "string" }
-        },
-        "required": ["source", "method", "confidence", "timestamp"]
-      }
-    }
-  }
-}
+# =====================================================================
+# 2. VECTOR DB SIMULATOR (RAG-BASED SKILL CANONICALIZATION)
+# =====================================================================
+
+class VectorDBSimulator:
+    """
+    A lightweight, in-memory vector database simulator that uses TF-IDF over 
+    character 3-grams and Cosine Similarity to perform semantic-like skill searches.
+    """
+    def __init__(self, corpus: List[str]):
+        # Store unique skill names
+        self.corpus = list(set(corpus))
+        # Build vocabulary of character 3-grams
+        vocab = set()
+        for word in self.corpus:
+            for gram in self.get_ngrams(word, 3):
+                vocab.add(gram)
+        self.vocab = list(vocab)
+        self.vocab_index = {gram: i for i, gram in enumerate(self.vocab)}
+        
+        # Pre-compute normalized TF-IDF vectors for all skills in the database
+        self.vectors = []
+        for word in self.corpus:
+            self.vectors.append(self.vectorize(word))
+            
+    def get_ngrams(self, text: str, n: int) -> List[str]:
+        # Wrap text in underscores and lowercase it to capture word boundaries
+        text_clean = f"_{text.lower().strip()}_"
+        return [text_clean[i:i+n] for i in range(len(text_clean) - n + 1)]
+        
+    def vectorize(self, text: str) -> List[float]:
+        # Count 3-grams
+        vec = [0.0] * len(self.vocab)
+        ngrams = self.get_ngrams(text, 3)
+        for gram in ngrams:
+            if gram in self.vocab_index:
+                vec[self.vocab_index[gram]] += 1.0
+        # Compute L2 norm to normalize the vector
+        norm = math.sqrt(sum(x * x for x in vec))
+        if norm > 0:
+            vec = [x / norm for x in vec]
+        return vec
+        
+    def query(self, text: str, top_k: int = 1) -> List[Tuple[str, float]]:
+        # Vectorize input query
+        query_vec = self.vectorize(text)
+        results = []
+        # Calculate Cosine Similarity (dot product of normalized vectors)
+        for idx, word in enumerate(self.corpus):
+            db_vec = self.vectors[idx]
+            similarity = sum(query_vec[i] * db_vec[i] for i in range(len(self.vocab)))
+            results.append((word, similarity))
+        # Sort by similarity descending
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:top_k]
+
+# Initialize the global skill Vector DB
+ALL_SKILL_NAMES = list(set([v[0] for v in CANONICAL_SKILLS.values()] + list(CANONICAL_SKILLS.keys())))
+SKILL_VECTOR_DB = VectorDBSimulator(ALL_SKILL_NAMES)
 
 # =====================================================================
-# 2. PYDANTIC MODELS
+# 3. PYDANTIC MODELS
 # =====================================================================
 
 class PersonalInfo(BaseModel):
@@ -228,6 +191,8 @@ class CandidateSkill(BaseModel):
     category: Optional[str] = None
     similarity_score: float = 0.0
     confidence: float = 1.0
+    confidence_explanation: Optional[str] = None
+    sources: List[str] = Field(default_factory=list)
 
 class WorkExperience(BaseModel):
     role: Optional[str] = None
@@ -249,6 +214,7 @@ class ProjectInfo(BaseModel):
     description: Optional[str] = None
     url: Optional[str] = None
     technologies: List[str] = Field(default_factory=list)
+    source: Optional[str] = None
 
 class SectionConfidence(BaseModel):
     personal_info: float = 0.0
@@ -281,14 +247,14 @@ class UniversalCandidate(BaseModel):
     validation_errors: List[str] = Field(default_factory=list)
 
 # =====================================================================
-# 3. HELPERS & UTILITIES
+# 4. HELPERS & UTILITIES
 # =====================================================================
 
 def get_now_str() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 # =====================================================================
-# 4. DOCUMENT PARSERS
+# 5. DOCUMENT PARSERS
 # =====================================================================
 
 class ATSParser:
@@ -305,7 +271,6 @@ class ATSParser:
 
     @classmethod
     def parse(cls, data: Dict[str, Any]) -> UniversalCandidate:
-        # Recursively unwrap nested wrapper keys
         if isinstance(data, dict):
             data = data.copy()
             changed = True
@@ -353,7 +318,7 @@ class ATSParser:
 
             for sk in data.get("skills", []):
                 name = sk if isinstance(sk, str) else sk.get("name", "")
-                if name: candidate.skills.append(CandidateSkill(name=name, original_name=name, confidence=confidence))
+                if name: candidate.skills.append(CandidateSkill(name=name, original_name=name, confidence=confidence, sources=[source_name]))
 
             for w in data.get("work", []) or data.get("positions", []):
                 candidate.experience.append(WorkExperience(
@@ -395,7 +360,7 @@ class ATSParser:
 
             for sk in data.get("skills", []):
                 name = sk if isinstance(sk, str) else sk.get("name", "")
-                if name: candidate.skills.append(CandidateSkill(name=name, original_name=name, confidence=confidence))
+                if name: candidate.skills.append(CandidateSkill(name=name, original_name=name, confidence=confidence, sources=[source_name]))
 
             for emp in data.get("employment_history", []) or data.get("work_history", []):
                 candidate.experience.append(WorkExperience(
@@ -437,7 +402,7 @@ class ATSParser:
 
             for sk in data.get("skills_list", []) or data.get("skills", []):
                 name = sk if isinstance(sk, str) else sk.get("name", "")
-                if name: candidate.skills.append(CandidateSkill(name=name, original_name=name, confidence=confidence))
+                if name: candidate.skills.append(CandidateSkill(name=name, original_name=name, confidence=confidence, sources=[source_name]))
 
             for w in data.get("work_history", []):
                 candidate.experience.append(WorkExperience(
@@ -448,156 +413,134 @@ class ATSParser:
                     end_date=w.get("to_date") or w.get("end_date") or "Present",
                     description=w.get("job_description") or w.get("description")
                 ))
-            for e in data.get("education_profile", []) or data.get("education", []):
+            for ed in data.get("education_profile", []) or data.get("education", []):
                 candidate.education.append(EducationInfo(
-                    degree=e.get("degree_earned") or e.get("degree"),
-                    institution=e.get("school_attended") or e.get("institution") or e.get("school"),
-                    major=e.get("field_of_study") or e.get("major"),
-                    graduation_date=e.get("completion_date") or e.get("graduation_date")
+                    degree=ed.get("degree"),
+                    institution=ed.get("institution") or ed.get("school"),
+                    major=ed.get("major") or ed.get("field_of_study"),
+                    graduation_date=ed.get("graduation_date")
                 ))
 
-        else:
-            first = data.get("first_name") or data.get("firstName") or data.get("first") or ""
-            last = data.get("last_name") or data.get("lastName") or data.get("last") or ""
-            concat_name = f"{first} {last}".strip()
-            candidate.personal_info.full_name = (
-                data.get("name") or 
-                data.get("fullName") or 
-                data.get("candidate_name") or 
-                data.get("candidateName") or
-                (concat_name if concat_name else None)
-            )
+        else:  # Custom/Generic JSON Schema
+            candidate.personal_info.full_name = data.get("full_name") or data.get("name")
             if candidate.personal_info.full_name: add_prov("personal_info.full_name", "generic")
-            
-            email = data.get("email") or data.get("emailAddress") or data.get("email_address") or data.get("primary_email")
+            email = data.get("email") or data.get("email_address")
             if email:
-                candidate.personal_info.emails = [email] if isinstance(email, str) else email
+                candidate.personal_info.emails = [email]
                 add_prov("personal_info.emails", "generic")
-                
-            phone = data.get("phone") or data.get("phoneNumber") or data.get("phone_number") or data.get("mobile") or data.get("mobile_number")
+            phone = data.get("phone") or data.get("phone_number")
             if phone:
-                candidate.personal_info.phones = [phone] if isinstance(phone, str) else phone
+                candidate.personal_info.phones = [phone]
                 add_prov("personal_info.phones", "generic")
-            
-            location = data.get("location") or data.get("city") or data.get("address") or data.get("current_location")
-            if isinstance(location, dict):
-                parts = [location.get(k) for k in ["city", "state", "country", "name", "addressLine1"] if location.get(k)]
-                location = ", ".join(parts) if parts else None
-            elif location:
-                location = str(location)
-            
-            if location:
-                candidate.personal_info.location = location
-                add_prov("personal_info.location", "generic")
-                
-            # Gather individual link keys
-            all_links = []
-            links_val = data.get("urls") or data.get("links") or data.get("websites")
-            if links_val:
-                if isinstance(links_val, list):
-                    all_links.extend([str(l) for l in links_val if l])
+            loc = data.get("location") or data.get("address")
+            if loc:
+                if isinstance(loc, dict):
+                    loc_str = ", ".join(str(v) for v in loc.values() if v)
+                    candidate.personal_info.location = loc_str
                 else:
-                    all_links.append(str(links_val))
+                    candidate.personal_info.location = str(loc)
+                add_prov("personal_info.location", "generic")
             
-            for k in ["linkedin", "github", "leetcode", "twitter", "portfolio", "website", "social"]:
-                val = data.get(k)
-                if val and isinstance(val, str) and val.strip():
-                    if val.strip() not in all_links:
-                        all_links.append(val.strip())
+            # Extract links
+            links_input = data.get("links") or data.get("urls") or data.get("social_media") or []
+            raw_links = []
+            if isinstance(links_input, list):
+                raw_links.extend(links_input)
+            elif isinstance(links_input, str):
+                raw_links.append(links_input)
             
-            if all_links:
-                candidate.personal_info.links = all_links
+            for key in ["linkedin", "github", "portfolio", "blog", "website", "link"]:
+                val = data.get(key)
+                if val and isinstance(val, str):
+                    raw_links.append(val)
+                elif val and isinstance(val, list):
+                    raw_links.extend(val)
+
+            if raw_links:
+                candidate.personal_info.links = list(dict.fromkeys([str(l).strip() for l in raw_links if l]))
                 add_prov("personal_info.links", "generic")
-                
-            candidate.personal_info.headline = data.get("headline") or data.get("title")
-            if candidate.personal_info.headline: add_prov("personal_info.headline", "generic")
+            
+            skills_input = data.get("skills", [])
+            raw_skills = []
+            if isinstance(skills_input, dict):
+                for k, v in skills_input.items():
+                    if isinstance(v, list):
+                        raw_skills.extend(v)
+                    elif isinstance(v, str):
+                        raw_skills.append(v)
+            elif isinstance(skills_input, list):
+                for sk in skills_input:
+                    if isinstance(sk, str):
+                        raw_skills.append(sk)
+                    elif isinstance(sk, dict):
+                        name = sk.get("name") or sk.get("skill")
+                        if name: raw_skills.append(name)
+            
+            for sk in raw_skills:
+                candidate.skills.append(CandidateSkill(name=sk, original_name=sk, confidence=confidence, sources=[source_name]))
 
-            skills_val = data.get("skills") or data.get("skill_list")
-            if isinstance(skills_val, dict):
-                for key, val in skills_val.items():
-                    if isinstance(val, list):
-                        for sk in val:
-                            if isinstance(sk, str) and sk.strip():
-                                candidate.skills.append(CandidateSkill(name=sk.strip(), original_name=sk.strip(), confidence=confidence))
-                            elif isinstance(sk, dict) and sk.get("name"):
-                                candidate.skills.append(CandidateSkill(name=sk["name"].strip(), original_name=sk["name"].strip(), confidence=confidence))
-                    elif isinstance(val, str) and val.strip():
-                        candidate.skills.append(CandidateSkill(name=val.strip(), original_name=val.strip(), confidence=confidence))
-            elif isinstance(skills_val, list):
-                for sk in skills_val:
-                    if isinstance(sk, str) and sk.strip():
-                        candidate.skills.append(CandidateSkill(name=sk.strip(), original_name=sk.strip(), confidence=confidence))
-                    elif isinstance(sk, dict) and sk.get("name"):
-                        candidate.skills.append(CandidateSkill(name=sk["name"].strip(), original_name=sk["name"].strip(), confidence=confidence))
+            for w in data.get("experience", []) or data.get("work", []):
+                candidate.experience.append(WorkExperience(
+                    role=w.get("role") or w.get("title"),
+                    company=w.get("company"),
+                    start_date=w.get("start_date") or w.get("start"),
+                    end_date=w.get("end_date") or w.get("end"),
+                    description=w.get("description")
+                ))
 
-            for exp in data.get("experience") or data.get("work") or data.get("jobs") or []:
-                if isinstance(exp, dict):
-                    candidate.experience.append(WorkExperience(
-                        role=exp.get("role") or exp.get("title") or exp.get("job_title") or exp.get("designation"),
-                        company=exp.get("company") or exp.get("employer") or exp.get("organization") or exp.get("company_name"),
-                        location=exp.get("location"),
-                        start_date=exp.get("start_date") or exp.get("start") or exp.get("from") or exp.get("start_year"),
-                        end_date=exp.get("end_date") or exp.get("end") or exp.get("to") or exp.get("end_year"),
-                        description=exp.get("description") or exp.get("summary")
-                    ))
-            for ed in data.get("education") or data.get("schools") or data.get("studies") or []:
+            # Extract education
+            for ed in data.get("education", []) or data.get("schools", []) or data.get("education_history", []):
                 if isinstance(ed, dict):
                     candidate.education.append(EducationInfo(
                         degree=ed.get("degree") or ed.get("qualification"),
-                        institution=ed.get("institution") or ed.get("school") or ed.get("university"),
-                        major=ed.get("major") or ed.get("field") or ed.get("specialization") or ed.get("field_of_study"),
-                        graduation_date=ed.get("graduation_date") or ed.get("end") or ed.get("end_year") or ed.get("date")
+                        institution=ed.get("institution") or ed.get("school") or ed.get("name"),
+                        major=ed.get("major") or ed.get("fieldOfStudy") or ed.get("specialization") or ed.get("field_of_study"),
+                        graduation_date=str(ed.get("graduation_date") or ed.get("end") or ed.get("end_year") or "") or None
                     ))
-
         return candidate
 
 class CSVParser:
     @classmethod
     def parse(cls, file_bytes: bytes) -> UniversalCandidate:
+        df = pd.read_csv(io.BytesIO(file_bytes))
         candidate = UniversalCandidate()
-        try:
-            df = pd.read_csv(io.BytesIO(file_bytes))
-        except Exception as e:
-            raise ValueError(f"Invalid CSV layout: {str(e)}")
-            
-        if df.empty:
-            return candidate
-
-        columns = {col.lower().strip(): col for col in df.columns}
+        if df.empty: return candidate
+        
         source_name = "recruiter_csv"
         confidence = SOURCE_WEIGHTS[source_name]
         
         def add_prov(field: str, method: str):
             candidate.provenance[field] = FieldProvenance(
-                source=source_name, method=f"csv_column_{method}",
+                source=source_name, method=f"csv_header_{method}",
                 confidence=confidence, timestamp=get_now_str()
             )
 
+        columns = {c.lower().replace("_", "").replace(" ", ""): c for c in df.columns}
         first_row = df.iloc[0]
         
-        name_col = next((columns[k] for k in ["full_name", "name", "candidate_name", "fullname"] if k in columns), None)
+        name_col = next((columns[k] for k in ["fullname", "name", "candidate", "candidatename"] if k in columns), None)
         if name_col and pd.notna(first_row[name_col]):
             candidate.personal_info.full_name = str(first_row[name_col]).strip()
             add_prov("personal_info.full_name", "name")
             
-        email_col = next((columns[k] for k in ["email", "emails", "email_address"] if k in columns), None)
+        email_col = next((columns[k] for k in ["email", "emailaddress"] if k in columns), None)
         if email_col:
             emails = df[email_col].dropna().unique()
             candidate.personal_info.emails = [str(e).strip() for e in emails if str(e).strip()]
-            if candidate.personal_info.emails: add_prov("personal_info.emails", "email_list")
-                
-        phone_col = next((columns[k] for k in ["phone", "phones", "phone_number", "mobile"] if k in columns), None)
+            if candidate.personal_info.emails: add_prov("personal_info.emails", "emails_list")
+            
+        phone_col = next((columns[k] for k in ["phone", "phonenumber", "telephone"] if k in columns), None)
         if phone_col:
             phones = df[phone_col].dropna().unique()
             candidate.personal_info.phones = [str(p).strip() for p in phones if str(p).strip()]
-            if candidate.personal_info.phones: add_prov("personal_info.phones", "phone_list")
+            if candidate.personal_info.phones: add_prov("personal_info.phones", "phones_list")
 
         loc_col = next((columns[k] for k in ["location", "city", "address"] if k in columns), None)
         if loc_col and pd.notna(first_row[loc_col]):
             candidate.personal_info.location = str(first_row[loc_col]).strip()
             add_prov("personal_info.location", "location")
 
-        headline_col = next((columns[k] for k in ["headline", "title", "current_role", "role"] if k in columns), None)
+        headline_col = next((columns[k] for k in ["headline", "title", "currentrole", "role"] if k in columns), None)
         if headline_col and pd.notna(first_row[headline_col]):
             candidate.personal_info.headline = str(first_row[headline_col]).strip()
             add_prov("personal_info.headline", "headline")
@@ -608,7 +551,7 @@ class CSVParser:
             candidate.personal_info.links = [str(l).strip() for l in links if str(l).strip()]
             if candidate.personal_info.links: add_prov("personal_info.links", "links_list")
 
-        skills_col = next((columns[k] for k in ["skills", "skills_list", "key_skills"] if k in columns), None)
+        skills_col = next((columns[k] for k in ["skills", "skillslist", "keyskills"] if k in columns), None)
         if skills_col:
             raw_skills = []
             for item in df[skills_col].dropna():
@@ -616,10 +559,10 @@ class CSVParser:
                     cleaned_p = p.strip()
                     if cleaned_p and cleaned_p not in raw_skills: raw_skills.append(cleaned_p)
             for sk in raw_skills:
-                candidate.skills.append(CandidateSkill(name=sk, original_name=sk, confidence=confidence))
+                candidate.skills.append(CandidateSkill(name=sk, original_name=sk, confidence=confidence, sources=[source_name]))
 
         comp_col = next((columns[k] for k in ["company", "employer", "organization"] if k in columns), None)
-        role_col = next((columns[k] for k in ["role", "job_title", "title"] if k in columns), None)
+        role_col = next((columns[k] for k in ["role", "jobtitle", "title"] if k in columns), None)
         desc_col = next((columns[k] for k in ["description", "summary"] if k in columns), None)
         
         if comp_col or role_col:
@@ -627,14 +570,13 @@ class CSVParser:
                 comp = str(row[comp_col]).strip() if comp_col and pd.notna(row[comp_col]) else None
                 role = str(row[role_col]).strip() if role_col and pd.notna(row[role_col]) else None
                 desc = str(row[desc_col]).strip() if desc_col and pd.notna(row[desc_col]) else None
-                start_date = str(row[columns["start_date"]]) if "start_date" in columns and pd.notna(row[columns["start_date"]]) else None
-                end_date = str(row[columns["end_date"]]) if "end_date" in columns and pd.notna(row[columns["end_date"]]) else None
+                start_date = str(row[df.columns[0]]) if "start_date" in columns else None  # fallback
+                end_date = None
                 
                 if comp or role:
                     candidate.experience.append(WorkExperience(
                         company=comp, role=role, description=desc, start_date=start_date, end_date=end_date
                     ))
-
         return candidate
 
 class PDFParser:
@@ -668,8 +610,7 @@ class DOCXParser:
 class NotesParser:
     @classmethod
     def extract_text(cls, notes_input: Any) -> str:
-        if not notes_input:
-            return ""
+        if not notes_input: return ""
         if isinstance(notes_input, bytes):
             return notes_input.decode("utf-8", errors="ignore")
         return str(notes_input)
@@ -678,17 +619,13 @@ class GitHubParser:
     @classmethod
     def parse(cls, url: str) -> UniversalCandidate:
         candidate = UniversalCandidate()
-        if not url:
-            return candidate
+        if not url: return candidate
         url = url.strip()
         match = re.search(r'github\.com/([a-zA-Z0-9\-_]+)', url, re.IGNORECASE)
         if not match:
             raise ValueError(f"Malformed GitHub URL. Expected format: https://github.com/username")
 
         username = match.group(1)
-        if username.lower() == "unavailable":
-            raise httpx.RequestError("GitHub API rate limit exceeded or service down.", request=None)
-
         source_name = "github_url"
         confidence = SOURCE_WEIGHTS[source_name]
         
@@ -710,11 +647,11 @@ class GitHubParser:
             repos_response = httpx.get(f"https://api.github.com/users/{username}/repos?sort=updated&per_page=5", headers=headers, timeout=4.0)
             repos_data = repos_response.json() if repos_response.status_code == 200 else []
         except Exception:
-            # Fallback Simulator
+            # Fallback Simulator for local offline development
             profile_data = {
                 "name": username.replace("-", " ").title(),
                 "email": f"{username}@github-mock.io",
-                "bio": "Full-stack software developer. Built projects with React and FastAPI.",
+                "bio": "Full-stack software developer. Built projects with React, Java, and FastAPI.",
                 "location": "San Francisco, CA",
                 "blog": f"https://{username}.io",
                 "html_url": f"https://github.com/{username}"
@@ -748,26 +685,26 @@ class GitHubParser:
             if lang: languages.add(lang)
             candidate.projects.append(ProjectInfo(
                 name=repo.get("name"), description=repo.get("description"),
-                url=repo.get("html_url"), technologies=[lang] if lang else []
+                url=repo.get("html_url"), technologies=[lang] if lang else [],
+                source=source_name
             ))
             
         for lang in languages:
             candidate.skills.append(CandidateSkill(
-                name=lang, original_name=lang, confidence=confidence, category="Programming Language"
+                name=lang, original_name=lang, confidence=confidence, category="Programming Language", sources=[source_name]
             ))
 
         return candidate
 
 # =====================================================================
-# 5. ENTITY EXTRACTOR (UNSTRUCTURED SEGMENTER)
+# 6. ENTITY EXTRACTOR (UNSTRUCTURED SEGMENTER)
 # =====================================================================
 
 class EntityExtractor:
     @classmethod
     def extract_from_text(cls, text: str, source_name: str, confidence: float) -> UniversalCandidate:
         candidate = UniversalCandidate()
-        if not text.strip():
-            return candidate
+        if not text.strip(): return candidate
 
         def add_prov(field: str, method: str):
             candidate.provenance[field] = FieldProvenance(
@@ -778,7 +715,7 @@ class EntityExtractor:
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         name_found = False
         if lines:
-            # Check prefixes first (e.g. "Candidate: Alex Mercer" or "Name: Kesavardhini C")
+            # Check prefixes first
             for line in lines[:5]:
                 match = re.search(r'^(?:candidate|name|full\s*name)\s*:\s*([a-zA-Z\s\.\-\_]+)', line, re.IGNORECASE)
                 if match:
@@ -826,7 +763,6 @@ class EntityExtractor:
             candidate.personal_info.location = loc_match.group(0).strip()
             add_prov("personal_info.location", "regex_city_state")
 
-        # Segmentation
         sections = cls.segment_sections(text)
 
         if "skills" in sections:
@@ -836,13 +772,16 @@ class EntityExtractor:
                 cleaned_sk = rsk.strip()
                 if cleaned_sk and len(cleaned_sk) > 1 and len(cleaned_sk) < 40:
                     if not cleaned_sk.lower() in ["skills", "technical skills", "languages", "technologies"]:
-                        candidate.skills.append(CandidateSkill(name=cleaned_sk, original_name=cleaned_sk, confidence=confidence))
+                        candidate.skills.append(CandidateSkill(name=cleaned_sk, original_name=cleaned_sk, confidence=confidence, sources=[source_name]))
 
         if "experience" in sections:
             candidate.experience = cls.parse_experience_section(sections["experience"])
 
         if "education" in sections:
             candidate.education = cls.parse_education_section(sections["education"])
+
+        if "projects" in sections:
+            candidate.projects = cls.parse_projects_section(sections["projects"], source_name)
 
         return candidate
 
@@ -851,7 +790,8 @@ class EntityExtractor:
         headers = {
             "skills": [r'skills', r'technical skills', r'core competencies', r'expertise', r'languages & technologies'],
             "experience": [r'experience', r'work history', r'professional experience', r'employment history', r'work experience'],
-            "education": [r'education', r'academic background', r'qualifications', r'academic profile']
+            "education": [r'education', r'academic background', r'qualifications', r'academic profile'],
+            "projects": [r'projects', r'personal projects', r'featured projects', r'academic projects', r'key projects']
         }
         sections = {}
         lines = text.split("\n")
@@ -879,6 +819,34 @@ class EntityExtractor:
         if current_section and current_content:
             sections[current_section] = "\n".join(current_content)
         return sections
+
+    @classmethod
+    def parse_projects_section(cls, text: str, source_name: str) -> List[ProjectInfo]:
+        projects = []
+        blocks = re.split(r'\n(?=[A-Z•\-\*][a-zA-Z\s\-]{2,40}\b)', text)
+        for block in blocks:
+            lines = [l.strip() for l in block.split("\n") if l.strip()]
+            if not lines: continue
+            
+            name = re.sub(r'^[•\-\*]\s*', '', lines[0]).strip()
+            desc_lines = []
+            technologies = []
+            
+            for line in lines[1:]:
+                desc_lines.append(line)
+                for skill_name in CANONICAL_SKILLS.keys():
+                    pattern = r'\b' + re.escape(skill_name) + r'\b'
+                    if re.search(pattern, line, re.IGNORECASE):
+                        technologies.append(skill_name)
+            
+            if name and len(name) < 100:
+                projects.append(ProjectInfo(
+                    name=name,
+                    description="\n".join(desc_lines) if desc_lines else None,
+                    technologies=list(set(technologies)),
+                    source=source_name
+                ))
+        return projects
 
     @classmethod
     def parse_experience_section(cls, text: str) -> List[WorkExperience]:
@@ -985,7 +953,7 @@ class EntityExtractor:
         return education
 
 # =====================================================================
-# 6. NORMALIZERS & VALUE REFINEMENT
+# 7. NORMALIZERS & VALUE REFINEMENT
 # =====================================================================
 
 class Normalizer:
@@ -1044,7 +1012,7 @@ class Normalizer:
             normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
         normalized = re.sub(r'\s+', ' ', normalized).strip().title()
         
-        # acronym overrides
+        # Acronym overrides
         for acr in ["IBM", "AWS", "SAP", "AMD", "HP", "GE", "Google", "Netflix", "Microsoft", "Meta"]:
             normalized = re.sub(r'\b' + re.escape(acr.title()) + r'\b', acr, normalized)
         return normalized, "abbreviation_expansion" if normalized != cleaned else "title_casing"
@@ -1067,6 +1035,71 @@ class Normalizer:
         normalized = normalized.split("?")[0]
         if normalized.endswith("/"): normalized = normalized[:-1]
         return normalized, "add_protocol_and_query_strip"
+
+    @staticmethod
+    def normalize_phone_custom(phone: Optional[str], format_style: str = "e164", default_region: str = "US") -> Tuple[Optional[str], Optional[str]]:
+        if not phone: return None, None
+        cleaned_phone = phone.strip()
+        
+        if format_style in ["none", "raw"] or not format_style:
+            return cleaned_phone, "raw"
+            
+        try:
+            parsed = phonenumbers.parse(cleaned_phone, default_region)
+            if phonenumbers.is_valid_number(parsed):
+                if format_style == "national":
+                    return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.NATIONAL), "phonenumbers_national"
+                else:
+                    return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164), "phonenumbers_e164"
+        except Exception:
+            pass
+            
+        # Fallback digits cleanup
+        digits = re.sub(r'\D', '', cleaned_phone)
+        if len(digits) == 10:
+            if format_style == "national":
+                return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}", "digits_fallback_national"
+            else:
+                return f"+1{digits}", "digits_fallback_us"
+        elif len(digits) > 10:
+            return f"+{digits}", "digits_fallback_intl"
+        return cleaned_phone, "unnormalized_fallback"
+
+    @staticmethod
+    def normalize_date_custom(date_str: Optional[str], format_style: str = "iso") -> Tuple[Optional[str], Optional[str]]:
+        if not date_str: return None, None
+        d_clean = date_str.strip()
+        
+        if format_style in ["none", "raw"] or not format_style:
+            return d_clean, "raw"
+            
+        norm_val, method = Normalizer.normalize_date(d_clean)
+        if not norm_val or norm_val.lower() == "present":
+            return norm_val or d_clean, method
+            
+        parts = norm_val.split("-")
+        if format_style == "yyyy":
+            return parts[0], "yyyy"
+        elif format_style == "yyyy-mm":
+            if len(parts) >= 2:
+                return f"{parts[0]}-{parts[1]}", "yyyy-mm"
+            else:
+                return parts[0], "yyyy-mm"
+        else:
+            return norm_val, "yyyy-mm-dd"
+
+    @staticmethod
+    def normalize_company_custom(company_str: Optional[str], format_style: str = "expanded") -> Tuple[Optional[str], Optional[str]]:
+        if not company_str: return None, None
+        c_clean = company_str.strip()
+        
+        if format_style in ["none", "raw"] or not format_style:
+            return c_clean, "raw"
+            
+        if format_style == "titlecase":
+            return c_clean.title(), "titlecase"
+            
+        return Normalizer.normalize_company(c_clean)
 
     @classmethod
     def normalize_candidate(cls, candidate: UniversalCandidate, config: dict) -> UniversalCandidate:
@@ -1093,14 +1126,17 @@ class Normalizer:
             p_info.emails = normalized_emails
             update_prov("personal_info.emails", "email_normalizer", "lowercase_and_trim")
 
-        if config.get("normalize_phones", True):
+        phone_style = config.get("normalize_phones", "e164")
+        if phone_style not in [False, "none", "raw"]:
+            if phone_style is True:
+                phone_style = "e164"
             normalized_phones = []
             for p in p_info.phones:
-                norm_p, _ = cls.normalize_phone(p)
+                norm_p, norm_m = cls.normalize_phone_custom(p, phone_style)
                 if norm_p: normalized_phones.append(norm_p)
             if normalized_phones:
                 p_info.phones = normalized_phones
-                update_prov("personal_info.phones", "phone_normalizer", "e164_formatting")
+                update_prov("personal_info.phones", "phone_normalizer", norm_m)
 
         if p_info.location:
             norm_l, norm_m = cls.normalize_location(p_info.location)
@@ -1115,74 +1151,90 @@ class Normalizer:
             p_info.links = normalized_links
             update_prov("personal_info.links", "url_normalizer", "add_protocol")
 
-        if config.get("normalize_dates", True):
+        date_style = config.get("normalize_dates", "iso")
+        if date_style not in [False, "none", "raw"]:
+            if date_style is True:
+                date_style = "iso"
             for idx, exp in enumerate(candidate.experience):
                 if exp.start_date:
-                    norm_start, _ = cls.normalize_date(exp.start_date)
+                    norm_start, norm_m = cls.normalize_date_custom(exp.start_date, date_style)
                     exp.start_date = norm_start
-                    update_prov(f"experience[{idx}].start_date", "date_normalizer", "iso8601")
+                    update_prov(f"experience[{idx}].start_date", "date_normalizer", norm_m)
                 if exp.end_date:
-                    norm_end, _ = cls.normalize_date(exp.end_date)
+                    norm_end, norm_m = cls.normalize_date_custom(exp.end_date, date_style)
                     exp.end_date = norm_end
-                    update_prov(f"experience[{idx}].end_date", "date_normalizer", "iso8601")
+                    update_prov(f"experience[{idx}].end_date", "date_normalizer", norm_m)
             for idx, edu in enumerate(candidate.education):
                 if edu.graduation_date:
-                    norm_grad, _ = cls.normalize_date(edu.graduation_date)
+                    norm_grad, norm_m = cls.normalize_date_custom(edu.graduation_date, date_style)
                     edu.graduation_date = norm_grad
-                    update_prov(f"education[{idx}].graduation_date", "date_normalizer", "iso8601")
+                    update_prov(f"education[{idx}].graduation_date", "date_normalizer", norm_m)
 
-        if config.get("normalize_companies", True):
+        company_style = config.get("normalize_companies", "expanded")
+        if company_style not in [False, "none", "raw"]:
+            if company_style is True:
+                company_style = "expanded"
             for idx, exp in enumerate(candidate.experience):
                 if exp.company:
-                    norm_c, norm_m = cls.normalize_company(exp.company)
+                    norm_c, norm_m = cls.normalize_company_custom(exp.company, company_style)
                     exp.company = norm_c
                     update_prov(f"experience[{idx}].company", "company_normalizer", norm_m)
 
         return candidate
 
 # =====================================================================
-# 7. FUZZY CANONICALIZATION, DEDUPLICATOR & CONFLICT RESOLUTION
+# 8. RAG-BASED SKILL CANONICALIZATION & DEDUPLICATOR
 # =====================================================================
 
 class Canonicalizer:
     @classmethod
-    def canonicalize_skills(cls, skills: List[CandidateSkill], threshold: float = 75.0) -> List[CandidateSkill]:
+    def canonicalize_skills(cls, skills: List[CandidateSkill], threshold: float = 0.70) -> List[CandidateSkill]:
+        """
+        Runs RAG-based Skill Canonicalization using our local Vector DB simulator.
+        Queries the database for vector matches, falls back to fuzzy matching, and sets categories.
+        """
         canonicalized = []
         for sk in skills:
             original = sk.name.strip()
             if not original: continue
             
-            # Exact check
-            exact_match = None
-            for skill_key, val in CANONICAL_SKILLS.items():
-                if original.lower() == skill_key.lower():
-                    exact_match = val
-                    break
-            if exact_match:
-                canonicalized.append(CandidateSkill(
-                    name=exact_match[0], original_name=original, is_canonical=True,
-                    category=exact_match[1], similarity_score=100.0, confidence=sk.confidence
-                ))
-                continue
+            # Query the TF-IDF / Cosine Similarity Vector DB
+            vector_results = SKILL_VECTOR_DB.query(original, top_k=1)
+            
+            if vector_results and vector_results[0][1] >= threshold:
+                best_skill_name, similarity = vector_results[0]
                 
-            # Fuzzy match
-            best_match = None
-            best_score = 0.0
-            for skill_key, (canon_name, category) in CANONICAL_SKILLS.items():
-                score = float(fuzz.token_sort_ratio(original.lower(), skill_key.lower()))
-                if score > best_score:
-                    best_score = score
-                    best_match = (canon_name, category)
-            if best_match and best_score >= threshold:
+                # Find canonical name and category
+                canon_name = best_skill_name
+                category = "Skill"
+                if best_skill_name in CANONICAL_SKILLS:
+                    canon_name, category = CANONICAL_SKILLS[best_skill_name]
+                else:
+                    for k, (c_name, cat) in CANONICAL_SKILLS.items():
+                        if c_name.lower() == best_skill_name.lower():
+                            canon_name = c_name
+                            category = cat
+                            break
+                
                 canonicalized.append(CandidateSkill(
-                    name=best_match[0], original_name=original, is_canonical=True,
-                    category=best_match[1], similarity_score=round(best_score, 2),
-                    confidence=round(sk.confidence * (best_score / 100.0), 2)
+                    name=canon_name,
+                    original_name=original,
+                    is_canonical=True,
+                    category=category,
+                    similarity_score=round(similarity * 100.0, 2),
+                    confidence=sk.confidence,
+                    sources=sk.sources
                 ))
             else:
+                # Keep original name if no close vector match is found
                 canonicalized.append(CandidateSkill(
-                    name=original, original_name=original, is_canonical=False,
-                    category="Unverified", similarity_score=0.0, confidence=sk.confidence * 0.5
+                    name=original,
+                    original_name=original,
+                    is_canonical=False,
+                    category="Unverified",
+                    similarity_score=0.0,
+                    confidence=sk.confidence * 0.5,
+                    sources=sk.sources
                 ))
         return canonicalized
 
@@ -1191,17 +1243,17 @@ class Canonicalizer:
         if not degree: return None
         deg_clean = degree.strip()
         
-        # 1. Custom boundary check for acronyms (e.g., "B.S. in Computer Science" -> "Bachelor of Science")
+        # Boundary check for acronyms
         for k, val in CANONICAL_DEGREES.items():
             pattern = r'(?:^|[^a-zA-Z0-9])' + re.escape(k) + r'(?:$|[^a-zA-Z0-9])'
             if re.search(pattern, deg_clean, re.IGNORECASE):
                 return val
 
-        # 2. Exact match check
+        # Exact match check
         for k, val in CANONICAL_DEGREES.items():
             if deg_clean.lower() == k.lower(): return val
         
-        # 3. Fuzzy match check
+        # Fuzzy match check
         best_match = None
         best_score = 0.0
         for k, val in CANONICAL_DEGREES.items():
@@ -1215,12 +1267,25 @@ class Canonicalizer:
     @classmethod
     def canonicalize_candidate(cls, candidate: UniversalCandidate, config: dict) -> UniversalCandidate:
         timestamp = get_now_str()
-        if config.get("normalize_skills", True) and candidate.skills:
-            candidate.skills = cls.canonicalize_skills(candidate.skills)
-            candidate.provenance["skills"] = FieldProvenance(
-                source="canonicalization_engine", method="rapidfuzz_skills_kb_matching",
-                confidence=0.90, normalization_applied="mapped_to_skills_kb", timestamp=timestamp
-            )
+        skill_style = config.get("normalize_skills", "canonical")
+        if skill_style not in [False, "none", "raw"]:
+            if skill_style is True:
+                skill_style = "canonical"
+            
+            if skill_style == "lowercase":
+                for sk in candidate.skills:
+                    sk.name = sk.name.lower().strip()
+                candidate.provenance["skills"] = FieldProvenance(
+                    source="canonicalization_engine", method="lowercase_transformation",
+                    confidence=1.0, normalization_applied="lowercased", timestamp=timestamp
+                )
+            elif skill_style == "canonical":
+                candidate.skills = cls.canonicalize_skills(candidate.skills)
+                candidate.provenance["skills"] = FieldProvenance(
+                    source="canonicalization_engine", method="rag_vector_db_matching",
+                    confidence=0.90, normalization_applied="mapped_to_skills_vector_db", timestamp=timestamp
+                )
+
         if config.get("normalize_degrees", True) and candidate.education:
             for idx, edu in enumerate(candidate.education):
                 if edu.degree:
@@ -1236,6 +1301,7 @@ class Canonicalizer:
 class Deduplicator:
     @classmethod
     def deduplicate(cls, candidate: UniversalCandidate) -> UniversalCandidate:
+        # Deduplicate skills
         unique_skills = {}
         for sk in candidate.skills:
             key = sk.name.strip().lower()
@@ -1244,10 +1310,15 @@ class Deduplicator:
                 unique_skills[key] = sk
             else:
                 existing = unique_skills[key]
+                # Merge sources
+                merged_sources = list(set(existing.sources + sk.sources))
+                existing.sources = merged_sources
                 if sk.confidence > existing.confidence or sk.similarity_score > existing.similarity_score:
+                    sk.sources = merged_sources
                     unique_skills[key] = sk
         candidate.skills = list(unique_skills.values())
 
+        # Deduplicate work experience
         unique_exp = []
         for exp in candidate.experience:
             if not exp.company and not exp.role: continue
@@ -1277,6 +1348,7 @@ class Deduplicator:
             if not matched: unique_exp.append(exp)
         candidate.experience = unique_exp
 
+        # Deduplicate education
         unique_edu = []
         for edu in candidate.education:
             if not edu.institution: continue
@@ -1296,6 +1368,7 @@ class Deduplicator:
             if not matched: unique_edu.append(edu)
         candidate.education = unique_edu
 
+        # Deduplicate projects
         unique_proj = []
         for proj in candidate.projects:
             if not proj.name: continue
@@ -1317,6 +1390,10 @@ class Deduplicator:
 
         return candidate
 
+# =====================================================================
+# 9. CONFLICT RESOLUTION
+# =====================================================================
+
 class ConflictResolver:
     @classmethod
     def resolve(cls, parsed_sources: Dict[str, UniversalCandidate]) -> Tuple[UniversalCandidate, List[Dict[str, Any]]]:
@@ -1335,8 +1412,7 @@ class ConflictResolver:
             })
 
         active_sources = {k: v for k, v in parsed_sources.items() if v is not None}
-        if not active_sources:
-            return merged, conflict_logs
+        if not active_sources: return merged, conflict_logs
 
         # Resolve single-string fields
         for field in ["full_name", "location", "headline"]:
@@ -1387,28 +1463,42 @@ class ConflictResolver:
         for src_name, cand in active_sources.items():
             if cand.candidate_id and not merged.candidate_id:
                 merged.candidate_id = cand.candidate_id
-            for sk in cand.skills: merged.skills.append(sk.model_copy())
+            for sk in cand.skills:
+                # Add source to skill if not already present
+                sk_copy = sk.model_copy()
+                if src_name not in sk_copy.sources:
+                    sk_copy.sources.append(src_name)
+                merged.skills.append(sk_copy)
             for exp in cand.experience: merged.experience.append(exp.model_copy())
             for edu in cand.education: merged.education.append(edu.model_copy())
-            for proj in cand.projects: merged.projects.append(proj.model_copy())
+            for proj in cand.projects:
+                proj_copy = proj.model_copy()
+                if not proj_copy.source:
+                    proj_copy.source = src_name
+                merged.projects.append(proj_copy)
             for p_key, prov in cand.provenance.items():
                 if p_key not in merged.provenance: merged.provenance[p_key] = prov
 
         return merged, conflict_logs
 
 # =====================================================================
-# 8. SCORER & PROJECTION ENGINE
+# 10. CONFIDENCE SCORER (CROSS-REFERENCED SKILL SCORING & FORMULAS)
 # =====================================================================
 
 class ConfidenceScorer:
+    """
+    Computes overall and section-level confidence scores.
+    Implements the Cross-Reference algorithm for skills: penalizes skills found in resumes/notes 
+    but missing from GitHub/LinkedIn profiles if those links are provided. Shows step-by-step formulas.
+    """
     @classmethod
     def calculate(cls, candidate: UniversalCandidate) -> Tuple[ConfidenceScores, float]:
         scores = ConfidenceScores()
         p_info = candidate.personal_info
         p_prov = candidate.provenance
 
+        # 1. Personal Info Confidence
         p_confidences = []
-        # Required core fields
         for field, val in [("full_name", p_info.full_name)]:
             if val:
                 prov = p_prov.get(f"personal_info.{field}")
@@ -1423,7 +1513,6 @@ class ConfidenceScorer:
             else:
                 p_confidences.append(0.0)
 
-        # Optional fields only add if present (do not penalize if missing)
         for field, val in [("location", p_info.location), ("headline", p_info.headline)]:
             if val:
                 prov = p_prov.get(f"personal_info.{field}")
@@ -1436,11 +1525,90 @@ class ConfidenceScorer:
 
         scores.sections.personal_info = round(sum(p_confidences) / len(p_confidences), 2) if p_confidences else 0.0
 
+        # Check if candidate has GitHub or LinkedIn links
+        has_github = any("github.com" in link.lower() for link in p_info.links)
+        has_linkedin = any("linkedin.com" in link.lower() for link in p_info.links)
+
+        # 2. Skills Confidence (with Cross-Reference algorithm)
         if candidate.skills:
-            scores.sections.skills = round(sum(s.confidence for s in candidate.skills) / len(candidate.skills), 2)
+            skills_confidences = []
+            for sk in candidate.skills:
+                # Find base confidence from sources
+                base_conf = 0.0
+                if sk.sources:
+                    base_conf = max(get_source_weight(src) for src in sk.sources)
+                else:
+                    base_conf = sk.confidence or 0.70
+                
+                # Check if candidate mentions the skill in their resume/portfolio projects
+                in_local_projects = any(
+                    (not p.source or not p.source.startswith("github")) and (
+                        sk.name.lower() in (p.name or "").lower() or
+                        sk.name.lower() in (p.description or "").lower() or
+                        any(sk.name.lower() in t.lower() for t in p.technologies)
+                    )
+                    for p in candidate.projects
+                )
+
+                # Check GitHub projects specifically
+                in_github_repos = any(
+                    (p.source and p.source.startswith("github")) and (
+                        sk.name.lower() in (p.name or "").lower() or
+                        sk.name.lower() in (p.description or "").lower() or
+                        any(sk.name.lower() in t.lower() for t in p.technologies)
+                    )
+                    for p in candidate.projects
+                )
+                
+                from_github_source = "github_url" in sk.sources or any(src.startswith("github_url") for src in sk.sources)
+                
+                # Check work experience (often linked to LinkedIn)
+                in_experience = any(
+                    sk.name.lower() in (e.role or "").lower() or
+                    sk.name.lower() in (e.company or "").lower() or
+                    sk.name.lower() in (e.description or "").lower()
+                    for e in candidate.experience
+                )
+
+                in_github_or_linkedin = in_github_repos or from_github_source or (has_linkedin and in_experience)
+                is_verified = in_local_projects or in_github_repos or from_github_source or in_experience
+                
+                if (has_github or has_linkedin) and in_local_projects and not in_github_or_linkedin and not is_verified:
+                    # Severe penalty for mismatch between resume project and github/linkedin
+                    sk.confidence = round(base_conf * 0.40, 2)
+                    sk.confidence_explanation = (
+                        f"Formula: Base ({base_conf:.2f}) * Profile Mismatch Penalty (0.40) = {sk.confidence:.2f}\n\n"
+                        f"Reason: Mismatch! The candidate mentions '{sk.name}' in a resume project, but no '{sk.name}' repositories, languages, or work histories were found on their provided GitHub or LinkedIn profiles."
+                    )
+                elif has_github or has_linkedin:
+                    if is_verified:
+                        # Boost score by 10%
+                        sk.confidence = min(1.0, round(base_conf + 0.10, 2))
+                        sk.confidence_explanation = (
+                            f"Formula: min(1.0, Base ({base_conf:.2f}) + Boost (0.10)) = {sk.confidence:.2f}\n\n"
+                            f"Reason: Verified! This skill was successfully cross-referenced and found in the candidate's GitHub repositories or work experience."
+                        )
+                    else:
+                        # General penalty
+                        sk.confidence = round(base_conf * 0.50, 2)
+                        sk.confidence_explanation = (
+                            f"Formula: Base ({base_conf:.2f}) * Penalty (0.50) = {sk.confidence:.2f}\n\n"
+                            f"Reason: Mismatch! The candidate provided professional profile links (GitHub/LinkedIn) but no repositories or work history contain evidence of this skill."
+                        )
+                else:
+                    # Neutral score
+                    sk.confidence = round(base_conf, 2)
+                    sk.confidence_explanation = (
+                        f"Formula: Base ({base_conf:.2f}) = {sk.confidence:.2f}\n\n"
+                        f"Reason: Neutral. No GitHub or LinkedIn link was provided to verify or cross-reference this skill."
+                    )
+                skills_confidences.append(sk.confidence)
+            
+            scores.sections.skills = round(sum(skills_confidences) / len(skills_confidences), 2)
         else:
             scores.sections.skills = 0.0
 
+        # 3. Experience Confidence
         if candidate.experience:
             exp_conf = []
             for exp in candidate.experience:
@@ -1454,6 +1622,7 @@ class ConfidenceScorer:
         else:
             scores.sections.experience = 0.0
 
+        # 4. Education Confidence
         if candidate.education:
             edu_conf = []
             for edu in candidate.education:
@@ -1466,6 +1635,7 @@ class ConfidenceScorer:
         else:
             scores.sections.education = 0.0
 
+        # 5. Projects Confidence
         if candidate.projects:
             proj_conf = []
             for proj in candidate.projects:
@@ -1477,21 +1647,16 @@ class ConfidenceScorer:
         else:
             scores.sections.projects = 0.0
 
-        # Weights mapping
+        # Section Weights
         weights = {"personal_info": 0.30, "skills": 0.30, "experience": 0.25, "education": 0.10, "projects": 0.05}
         
-        # Calculate dynamic normalization weight
+        # Calculate dynamic overall score
         active_sections = {}
-        if p_confidences:
-            active_sections["personal_info"] = weights["personal_info"]
-        if candidate.skills:
-            active_sections["skills"] = weights["skills"]
-        if candidate.experience:
-            active_sections["experience"] = weights["experience"]
-        if candidate.education:
-            active_sections["education"] = weights["education"]
-        if candidate.projects:
-            active_sections["projects"] = weights["projects"]
+        if p_confidences: active_sections["personal_info"] = weights["personal_info"]
+        if candidate.skills: active_sections["skills"] = weights["skills"]
+        if candidate.experience: active_sections["experience"] = weights["experience"]
+        if candidate.education: active_sections["education"] = weights["education"]
+        if candidate.projects: active_sections["projects"] = weights["projects"]
 
         if active_sections:
             total_weight = sum(active_sections.values())
@@ -1514,79 +1679,693 @@ class ConfidenceScorer:
         candidate.confidence_scores = scores
         return scores, scores.overall_score
 
+# =====================================================================
+# 11. TRUST ANALYSIS ENGINE (SCIENTIFIC RATIOS & RECRUITER ACTIONS)
+# =====================================================================
+
+class TrustAnalyzer:
+    """
+    Builds recruiter-facing trust signals from deterministic ratios:
+    source reliability, agreement, conflict, completeness, freshness, and semantic/JD fit.
+    """
+    SECTION_FIELDS = {
+        "contact_details": ["full_name", "emails", "phones", "location", "links"],
+        "skills": ["skills"],
+        "experience": ["experience"],
+        "education": ["education"],
+        "projects": ["projects"]
+    }
+
+    SECTION_WEIGHTS = {
+        "contact_details": 0.10,
+        "skills": 0.25,
+        "experience": 0.25,
+        "education": 0.15,
+        "projects": 0.15,
+        "links_profile": 0.10
+    }
+
+    @staticmethod
+    def _clamp(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    @classmethod
+    def _section_sources(cls, candidate: UniversalCandidate, section: str) -> List[str]:
+        sources = []
+        if section == "contact_details":
+            for field in ["full_name", "emails", "phones", "location", "links"]:
+                prov = candidate.provenance.get(f"personal_info.{field}")
+                if prov: sources.append(prov.source)
+        elif section == "skills":
+            for sk in candidate.skills:
+                sources.extend(sk.sources)
+        elif section == "experience":
+            sources.extend(prov.source for key, prov in candidate.provenance.items() if key.startswith("experience"))
+        elif section == "education":
+            sources.extend(prov.source for key, prov in candidate.provenance.items() if key.startswith("education"))
+        elif section == "projects":
+            sources.extend(p.source for p in candidate.projects if p.source)
+        elif section == "links_profile":
+            prov = candidate.provenance.get("personal_info.links")
+            if prov: sources.append(prov.source)
+            sources.extend(sk.sources[0] for sk in candidate.skills if any(src.startswith("github") for src in sk.sources))
+        return [s for s in sources if s]
+
+    @classmethod
+    def _source_reliability(cls, sources: List[str]) -> float:
+        if not sources:
+            return 0.50
+        unique_sources = list(dict.fromkeys(sources))
+        return round(sum(get_source_weight(src) for src in unique_sources) / len(unique_sources), 2)
+
+    @classmethod
+    def _completeness(cls, candidate: UniversalCandidate, section: str) -> Tuple[float, List[str]]:
+        missing = []
+        p = candidate.personal_info
+        checks = {
+            "contact_details": [
+                ("full name", bool(p.full_name)),
+                ("email", bool(p.emails)),
+                ("phone", bool(p.phones)),
+                ("location", bool(p.location)),
+                ("profile links", bool(p.links)),
+            ],
+            "skills": [("skills", bool(candidate.skills))],
+            "experience": [("work experience", bool(candidate.experience))],
+            "education": [("education", bool(candidate.education))],
+            "projects": [("projects", bool(candidate.projects))],
+            "links_profile": [("GitHub or LinkedIn link", any("github.com" in l.lower() or "linkedin.com" in l.lower() for l in p.links))],
+        }
+        section_checks = checks.get(section, [])
+        if not section_checks:
+            return 0.0, missing
+        filled = 0
+        for label, ok in section_checks:
+            if ok:
+                filled += 1
+            else:
+                missing.append(label)
+        return round(filled / len(section_checks), 2), missing
+
+    @classmethod
+    def _agreement_ratio(cls, sources: Dict[str, UniversalCandidate], section: str) -> float:
+        active = [cand for cand in sources.values() if cand]
+        total = len(active)
+        if total <= 1:
+            return 1.0 if total == 1 else 0.0
+
+        if section == "skills":
+            counts = []
+            all_skills = set()
+            source_skills = []
+            for cand in active:
+                names = {sk.name.lower() for sk in cand.skills if sk.name}
+                source_skills.append(names)
+                all_skills |= names
+            for skill in all_skills:
+                counts.append(sum(1 for names in source_skills if skill in names) / total)
+            return round(sum(counts) / len(counts), 2) if counts else 0.0
+
+        field_map = {
+            "contact_details": [lambda c: c.personal_info.full_name, lambda c: c.personal_info.emails, lambda c: c.personal_info.phones],
+            "experience": [lambda c: [f"{e.company}|{e.role}" for e in c.experience]],
+            "education": [lambda c: [f"{e.institution}|{e.degree}" for e in c.education]],
+            "projects": [lambda c: [p.name for p in c.projects]],
+            "links_profile": [lambda c: c.personal_info.links],
+        }
+        extractors = field_map.get(section, [])
+        ratios = []
+        for extractor in extractors:
+            values = []
+            for cand in active:
+                val = extractor(cand)
+                if isinstance(val, list):
+                    val = tuple(sorted(str(v).lower() for v in val if v))
+                elif val:
+                    val = str(val).strip().lower()
+                if val:
+                    values.append(val)
+            if values:
+                most_common = max(values.count(v) for v in set(values))
+                ratios.append(most_common / total)
+        return round(sum(ratios) / len(ratios), 2) if ratios else 0.0
+
+    @classmethod
+    def _freshness_score(cls, candidate: UniversalCandidate, section: str) -> float:
+        dates = []
+        if section == "experience":
+            dates = [e.end_date or e.start_date for e in candidate.experience]
+        elif section == "education":
+            dates = [e.graduation_date for e in candidate.education]
+        elif section == "projects":
+            dates = [p.description for p in candidate.projects]
+        elif section == "links_profile":
+            return 0.85 if candidate.personal_info.links else 0.0
+        else:
+            return 0.80
+
+        parsed_dates = []
+        for raw in dates:
+            if not raw:
+                continue
+            if isinstance(raw, str) and raw.lower() == "present":
+                return 1.0
+            parsed = dateparser.parse(str(raw), settings={"PREFER_DAY_OF_MONTH": "first"})
+            if parsed:
+                parsed_dates.append(parsed)
+        if not parsed_dates:
+            return 0.60 if dates else 0.0
+        latest = max(parsed_dates)
+        age_months = max(0, (datetime.datetime.utcnow().year - latest.year) * 12 + (datetime.datetime.utcnow().month - latest.month))
+        return round(math.exp(-0.05 * age_months), 2)
+
+    @classmethod
+    def _semantic_quality(cls, candidate: UniversalCandidate, section: str, jd_match_result: Optional[Dict[str, Any]]) -> float:
+        if section == "skills":
+            if candidate.skills:
+                return round(sum(sk.confidence for sk in candidate.skills) / len(candidate.skills), 2)
+            return 0.0
+        if jd_match_result and section in ["experience", "skills"]:
+            return round((jd_match_result.get("score") or 0.0) / 100.0, 2)
+        return 0.70
+
+    @classmethod
+    def analyze(
+        cls,
+        candidate: UniversalCandidate,
+        sources: Dict[str, UniversalCandidate],
+        conflict_logs: List[Dict[str, Any]],
+        jd_match_result: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        sections = {}
+        all_missing = []
+        total_compared_fields = max(1, len(candidate.provenance) + len(conflict_logs))
+        conflict_ratio = round(len(conflict_logs) / total_compared_fields, 2)
+
+        for section in cls.SECTION_WEIGHTS:
+            reliability = cls._source_reliability(cls._section_sources(candidate, section))
+            agreement = cls._agreement_ratio(sources, section)
+            completeness, missing = cls._completeness(candidate, section)
+            freshness = cls._freshness_score(candidate, section)
+            semantic = cls._semantic_quality(candidate, section, jd_match_result)
+            section_confidence = round(cls._clamp(
+                reliability * 0.35 + agreement * 0.25 + freshness * 0.15 + completeness * 0.15 + semantic * 0.10
+            ), 2)
+            sections[section] = {
+                "score": section_confidence,
+                "source_reliability": reliability,
+                "source_agreement_ratio": agreement,
+                "freshness_score": freshness,
+                "completeness_ratio": completeness,
+                "semantic_match_quality": semantic,
+                "formula": "(reliability*0.35)+(agreement*0.25)+(freshness*0.15)+(completeness*0.15)+(semantic*0.10)",
+                "missing_fields": missing
+            }
+            all_missing.extend(f"{section}: {field}" for field in missing)
+
+        trust_score = round(sum(sections[s]["score"] * weight for s, weight in cls.SECTION_WEIGHTS.items()), 2)
+        jd_score = (jd_match_result or {}).get("score")
+        jd_score_norm = round(jd_score / 100.0, 2) if isinstance(jd_score, (int, float)) else None
+        overall_match_score = round((trust_score * 0.70) + ((jd_score_norm if jd_score_norm is not None else trust_score) * 0.30), 2)
+
+        if overall_match_score >= 0.80:
+            action = "Recommended"
+        elif overall_match_score >= 0.60:
+            action = "Needs Review"
+        else:
+            action = "Not Recommended"
+
+        top_skills = sorted(candidate.skills, key=lambda sk: sk.confidence, reverse=True)[:5]
+        strengths = []
+        if sections["skills"]["score"] >= 0.75 and top_skills:
+            strengths.append("Strong skill evidence: " + ", ".join(sk.name for sk in top_skills[:3]))
+        if sections["contact_details"]["completeness_ratio"] >= 0.80:
+            strengths.append("Contact profile is mostly complete.")
+        if sections["projects"]["score"] >= 0.70:
+            strengths.append("Project evidence supports the profile.")
+        if jd_score_norm is not None and jd_score_norm >= 0.70:
+            strengths.append("Candidate aligns well with the job description.")
+
+        risks = []
+        if conflict_logs:
+            risks.append(f"{len(conflict_logs)} conflicting field(s) need recruiter review.")
+        if all_missing:
+            risks.append(f"Missing information detected in {min(len(all_missing), 4)} key area(s).")
+        if sections["links_profile"]["score"] < 0.50:
+            risks.append("External profile evidence is weak or missing.")
+        if not risks:
+            risks.append("No major profile risks detected by rule-based validation.")
+
+        most_reliable_source = None
+        if sources:
+            most_reliable_source = max(sources.keys(), key=get_source_weight)
+
+        summary_name = candidate.personal_info.full_name or "This candidate"
+        summary_bits = [
+            f"{summary_name} has an overall trust score of {round(trust_score * 100)}%.",
+            f"The strongest section is {max(sections, key=lambda s: sections[s]['score']).replace('_', ' ')}.",
+            f"Recruiter action: {action}."
+        ]
+
+        return {
+            "candidate_summary": " ".join(summary_bits),
+            "overall_trust_score": trust_score,
+            "overall_match_score": overall_match_score,
+            "recommendation": action,
+            "most_reliable_source": most_reliable_source,
+            "source_reliability_scores": {src: get_source_weight(src) for src in sources.keys()},
+            "section_scores": sections,
+            "ratios": {
+                "conflict_ratio": conflict_ratio,
+                "missing_information_ratio": round(len(all_missing) / max(1, sum(len(v.get("missing_fields", [])) + 1 for v in sections.values())), 2),
+                "source_count": len(sources)
+            },
+            "missing_information": all_missing,
+            "inconsistencies": conflict_logs,
+            "strengths": strengths or ["Profile has usable evidence but needs more corroboration."],
+            "risks": risks,
+            "scoring_notes": {
+                "section_formula": "Source Reliability 35% + Cross-Source Consistency 25% + Freshness 15% + Completeness 15% + Semantic Match 10%",
+                "freshness_formula": "e^(-0.05 * age_in_months)",
+                "overall_formula": "sum(section_score * section_weight)",
+                "recommendation_thresholds": "Recommended >= 80%, Needs Review 60-79%, Not Recommended < 60%"
+            }
+        }
+# =====================================================================
+# 12. JOB DESCRIPTION MATCHING ENGINE
+# =====================================================================
+
+class JDMatcher:
+    """
+    Matches candidate skills and experience against a provided Job Description (JD).
+    """
+    @classmethod
+    def match(cls, candidate: UniversalCandidate, jd_text: str) -> Dict[str, Any]:
+        if not jd_text or not jd_text.strip():
+            return {
+                "score": 0.0,
+                "matched_skills": [],
+                "missing_skills": [],
+                "explanation": "No job description provided."
+            }
+            
+        # Extract skills from Job Description using our Vector DB
+        jd_words = re.split(r'[\s,\.;\(\)\/\n\?]', jd_text.lower())
+        jd_words = list(set([w.strip() for w in jd_words if len(w.strip()) > 1]))
+        
+        # Find matches against known canonical skills
+        jd_skills = set()
+        for word in jd_words:
+            vector_results = SKILL_VECTOR_DB.query(word, top_k=1)
+            if vector_results and vector_results[0][1] >= 0.85:
+                jd_skills.add(vector_results[0][0])
+                
+        # If no skills were matched, extract using exact matches of CANONICAL_SKILLS
+        if not jd_skills:
+            for key, (canon_name, _) in CANONICAL_SKILLS.items():
+                if re.search(r'\b' + re.escape(key.lower()) + r'\b', jd_text.lower()):
+                    jd_skills.add(canon_name)
+                    
+        # Match candidate skills
+        candidate_skills_map = {sk.name.lower(): sk for sk in candidate.skills}
+        matched_skills = []
+        missing_skills = []
+        
+        score_sum = 0.0
+        max_possible_score = len(jd_skills) if jd_skills else 1.0
+        
+        for jd_sk in jd_skills:
+            if jd_sk.lower() in candidate_skills_map:
+                cand_sk = candidate_skills_map[jd_sk.lower()]
+                matched_skills.append(jd_sk)
+                # Score is weighted by the candidate's confidence in that skill
+                score_sum += cand_sk.confidence
+            else:
+                missing_skills.append(jd_sk)
+                
+        skill_match_score = (score_sum / max_possible_score) * 100.0 if jd_skills else 0.0
+        
+        # Calculate experience match (keyword overlap)
+        exp_keywords = ["experience", "years", "senior", "lead", "engineer", "developer", "manager"]
+        exp_matches = 0
+        for kw in exp_keywords:
+            if re.search(r'\b' + re.escape(kw) + r'\b', jd_text.lower()):
+                # Check if candidate experience contains this keyword
+                cand_has_kw = any(
+                    re.search(r'\b' + re.escape(kw) + r'\b', (e.role or "").lower() or (e.description or "").lower())
+                    for e in candidate.experience
+                )
+                if cand_has_kw: exp_matches += 1
+                
+        exp_match_score = (exp_matches / len(exp_keywords)) * 100.0 if exp_keywords else 100.0
+        
+        # Overall Match Score: 70% skills, 30% experience keywords
+        overall_score = round((0.70 * skill_match_score) + (0.30 * exp_match_score), 1)
+        # Cap at 100
+        overall_score = min(100.0, overall_score)
+        
+        explanation = (
+            f"Candidate matches {len(matched_skills)} out of {len(jd_skills)} skills identified in the Job Description. "
+            f"Skills Score: {skill_match_score:.1f}%. Experience Alignment Score: {exp_match_score:.1f}%."
+        )
+        
+        return {
+            "score": overall_score,
+            "matched_skills": sorted(list(matched_skills)),
+            "missing_skills": sorted(list(missing_skills)),
+            "explanation": explanation
+        }
+
+# =====================================================================
+# 12. CONFIGURABLE PROJECTION ENGINE & VALIDATOR (THE TWIST)
+# =====================================================================
+
+# Flat output schema requested by the user
+BASE_JSON_SCHEMA = {
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CanonicalCandidate",
+  "type": "object",
+  "properties": {
+    "candidate_id": { "type": "string" },
+    "full_name": { "type": ["string", "null"] },
+    "emails": {
+      "type": "array",
+      "items": { "type": "string", "format": "email" }
+    },
+    "phones": { "type": ["string", "null"] },
+    "location": {
+      "type": ["object", "null"],
+      "properties": {
+        "city": { "type": ["string", "null"] },
+        "region": { "type": ["string", "null"] },
+        "country": { "type": ["string", "null"] }
+      }
+    },
+    "links": {
+      "type": ["object", "null"],
+      "properties": {
+        "linkedin": { "type": ["string", "null"] },
+        "github": { "type": ["string", "null"] },
+        "portfolio": { "type": ["string", "null"] },
+        "other": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "headline": { "type": ["string", "null"] },
+    "years_experience": { "type": ["number", "null"] },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "confidence": { "type": "number" },
+          "sources": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["name"]
+      }
+    },
+    "experience": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "company": { "type": ["string", "null"] },
+          "title": { "type": ["string", "null"] },
+          "start": { "type": ["string", "null"] },
+          "end": { "type": ["string", "null"] },
+          "summary": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "education": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "institution": { "type": ["string", "null"] },
+          "degree": { "type": ["string", "null"] },
+          "field": { "type": ["string", "null"] },
+          "end_year": { "type": ["integer", "null"] }
+        }
+      }
+    },
+    "provenance": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "overall_confidence": { "type": "number" }
+  }
+}
+
+# =====================================================================
+# 12. CONFIGURABLE PROJECTION ENGINE & VALIDATOR (THE TWIST)
+# =====================================================================
+
+COUNTRY_ISO_MAP = {
+    "afghanistan": "AF", "albania": "AL", "algeria": "DZ", "andorra": "AD", "angola": "AO",
+    "argentina": "AR", "armenia": "AM", "australia": "AU", "austria": "AT", "azerbaijan": "AZ",
+    "bahamas": "BS", "bahrain": "BH", "bangladesh": "BD", "barbados": "BB", "belarus": "BY",
+    "belgium": "BE", "belize": "BZ", "benin": "BJ", "bhutan": "BT", "bolivia": "BO",
+    "bosnia": "BA", "botswana": "BW", "brazil": "BR", "brunei": "BN", "bulgaria": "BG",
+    "burkina faso": "BF", "burundi": "BI", "cambodia": "KH", "cameroon": "CM", "canada": "CA",
+    "cape verde": "CV", "central african republic": "CF", "chad": "TD", "chile": "CL", "china": "CN",
+    "colombia": "CO", "comoros": "KM", "congo": "CG", "costa rica": "CR", "croatia": "HR",
+    "cuba": "CU", "cyprus": "CY", "czech republic": "CZ", "denmark": "DK", "djibouti": "DJ",
+    "dominica": "DM", "dominican republic": "DO", "ecuador": "EC", "egypt": "EG", "el salvador": "SV",
+    "equatorial guinea": "GQ", "eritrea": "ER", "estonia": "EE", "eswatini": "SZ", "ethiopia": "ET",
+    "fiji": "FJ", "finland": "FI", "france": "FR", "gabon": "GA", "gambia": "GM",
+    "georgia": "GE", "germany": "DE", "ghana": "GH", "greece": "GR", "grenada": "GD",
+    "guatemala": "GT", "guinea": "GN", "guyana": "GY", "haiti": "HT", "honduras": "HN",
+    "hungary": "HU", "iceland": "IS", "india": "IN", "indonesia": "ID", "iran": "IR",
+    "iraq": "IQ", "ireland": "IE", "israel": "IL", "italy": "IT", "jamaica": "JM",
+    "japan": "JP", "jordan": "JO", "kazakhstan": "KZ", "kenya": "KE", "kiribati": "KI",
+    "korea": "KR", "kuwait": "KW", "kyrgyzstan": "KG", "laos": "LA", "latvia": "LV",
+    "lebanon": "LB", "lesotho": "LS", "liberia": "LR", "libya": "LY", "liechtenstein": "LI",
+    "lithuania": "LT", "luxembourg": "LU", "madagascar": "MG", "malawi": "MW", "malaysia": "MY",
+    "maldives": "MV", "mali": "ML", "malta": "MT", "mauritania": "MR", "mauritius": "MU",
+    "mexico": "MX", "micronesia": "FM", "moldova": "MD", "monaco": "MC", "mongolia": "MN",
+    "montenegro": "ME", "morocco": "MA", "mozambique": "MZ", "myanmar": "MM", "namibia": "NA",
+    "nauru": "NR", "nepal": "NP", "netherlands": "NL", "new zealand": "NZ", "nicaragua": "NI",
+    "niger": "NE", "nigeria": "NG", "north macedonia": "MK", "norway": "NO", "oman": "OM",
+    "pakistan": "PK", "palau": "PW", "panama": "PA", "papua new guinea": "PG", "paraguay": "PY",
+    "peru": "PE", "philippines": "PH", "poland": "PL", "portugal": "PT", "qatar": "QA",
+    "romania": "RO", "russia": "RU", "rwanda": "RW", "samoa": "WS", "san marino": "SM",
+    "saudi arabia": "SA", "senegal": "SN", "serbia": "RS", "seychelles": "SC", "sierra leone": "SL",
+    "singapore": "SG", "slovakia": "SK", "slovenia": "SI", "solomon islands": "SB", "somalia": "SO",
+    "south africa": "ZA", "spain": "ES", "sri lanka": "LK", "sudan": "SD", "suriname": "SR",
+    "sweden": "SE", "switzerland": "CH", "syria": "SY", "taiwan": "TW", "tajikistan": "TJ",
+    "tanzania": "TZ", "thailand": "TH", "timor-leste": "TL", "togo": "TG", "tonga": "TO",
+    "trinidad": "TT", "tunisia": "TN", "turkey": "TR", "turkmenistan": "TM", "tuvalu": "TV",
+    "uganda": "UG", "ukraine": "UA", "united arab emirates": "AE", "uae": "AE", "united kingdom": "GB",
+    "uk": "GB", "united states": "US", "usa": "US", "uruguay": "UY", "uzbekistan": "UZ",
+    "vanuatu": "VU", "vatican": "VA", "venezuela": "VE", "vietnam": "VN", "yemen": "YE",
+    "zambia": "ZM", "zimbabwe": "ZW"
+}
+
+def get_country_iso(name: str) -> Optional[str]:
+    if not name: return None
+    name_clean = name.strip().lower()
+    if name_clean in COUNTRY_ISO_MAP:
+        return COUNTRY_ISO_MAP[name_clean]
+    if len(name_clean) == 2:
+        return name_clean.upper()
+    for country_name, iso in COUNTRY_ISO_MAP.items():
+        if country_name in name_clean or name_clean in country_name:
+            return iso
+    return None
+
+def clean_date_to_yyyy_mm(d: Optional[str]) -> Optional[str]:
+    if not d: return None
+    d_clean = d.strip()
+    if d_clean.lower() in ["present", "current", "now", "ongoing", "active"]:
+        return "Present"
+    if re.match(r'^\d{4}-\d{2}$', d_clean):
+        return d_clean
+    try:
+        parsed = dateparser.parse(d_clean, settings={'PREFER_DAY_OF_MONTH': 'first'})
+        if parsed:
+            return parsed.strftime("%Y-%m")
+    except Exception:
+        pass
+    return d_clean
 
 class ProjectionEngine:
+    """
+    Projects the internal UniversalCandidate model into the flat default schema.
+    Applies the runtime config to reshape the output (field selection, remapping/renaming, 
+    toggling provenance/confidence, and missing value strategies).
+    """
     @classmethod
     def project(cls, candidate: UniversalCandidate, config: Dict[str, Any]) -> Dict[str, Any]:
-        data = candidate.model_dump()
-        res = {}
-        if candidate.candidate_id: res["candidate_id"] = candidate.candidate_id
+        # 1. Map to the flat default schema
+        p_info = candidate.personal_info
+        
+        # Parse location: "City, Region, Country"
+        loc_obj = {"city": None, "region": None, "country": None}
+        if p_info.location:
+            parts = [p.strip() for p in p_info.location.split(",")]
+            if len(parts) >= 3:
+                iso_country = get_country_iso(parts[2]) or parts[2][:2].upper()
+                loc_obj = {"city": parts[0], "region": parts[1], "country": iso_country}
+            elif len(parts) == 2:
+                iso_country = get_country_iso(parts[1])
+                if iso_country:
+                    loc_obj = {"city": parts[0], "region": None, "country": iso_country}
+                else:
+                    loc_obj = {"city": parts[0], "region": parts[1], "country": None}
+            else:
+                loc_obj = {"city": parts[0], "region": None, "country": None}
+                
+        # Parse links
+        links_obj = {"linkedin": None, "github": None, "portfolio": None, "other": []}
+        for link in p_info.links:
+            if "linkedin.com" in link.lower():
+                links_obj["linkedin"] = link
+            elif "github.com" in link.lower():
+                links_obj["github"] = link
+            elif "portfolio" in link.lower() or "personal" in link.lower() or not any(x in link.lower() for x in ["github.com", "linkedin.com"]):
+                links_obj["portfolio"] = link
+            else:
+                links_obj["other"].append(link)
 
-        missing_strategy = config.get("missing_values", "null")
+        # Calculate years of experience
+        total_months = sum(e.duration_months for e in candidate.experience if e.duration_months)
+        years_exp = round(total_months / 12.0, 1) if total_months > 0 else None
+
+        # Build initial flat default schema
+        flat_data = {
+            "candidate_id": candidate.candidate_id,
+            "full_name": p_info.full_name,
+            "emails": p_info.emails,
+            "phones": p_info.phones[0] if p_info.phones else None,
+            "location": loc_obj if p_info.location else None,
+            "links": links_obj if p_info.links else None,
+            "headline": p_info.headline,
+            "years_experience": years_exp,
+            "skills": [
+                {
+                    "name": sk.name,
+                    "confidence": sk.confidence,
+                    "sources": sk.sources
+                }
+                for sk in candidate.skills
+            ],
+            "experience": [
+                {
+                    "company": exp.company,
+                    "title": exp.role,
+                    "start": clean_date_to_yyyy_mm(exp.start_date),
+                    "end": clean_date_to_yyyy_mm(exp.end_date),
+                    "summary": exp.description
+                }
+                for exp in candidate.experience
+            ],
+            "education": [
+                {
+                    "institution": edu.institution,
+                    "degree": edu.degree,
+                    "field": edu.major,
+                    "end_year": int(edu.graduation_date.split("-")[0]) if edu.graduation_date and edu.graduation_date.split("-")[0].isdigit() else None
+                }
+                for edu in candidate.education
+            ],
+            "provenance": [
+                [k, prov.source, prov.method]
+                for k, prov in candidate.provenance.items()
+            ],
+            "overall_confidence": candidate.confidence_scores.overall_score
+        }
+
+        # 2. Apply config adjustments
+        missing_strategy = config.get("missing_values", "null")  # 'null' | 'omit' | 'error'
         selected_fields = config.get("selected_fields", [])
         if not selected_fields:
-            selected_fields = ["full_name", "emails", "phones", "skills", "experience", "education", "projects", "links", "location", "headline"]
+            selected_fields = list(BASE_JSON_SCHEMA["properties"].keys())
 
-        def handle_field(field_key: str, val: Any) -> Tuple[bool, Any]:
-            is_present = False
-            if val is not None:
-                if isinstance(val, list): is_present = len(val) > 0
-                elif isinstance(val, str): is_present = val.strip() != ""
-                else: is_present = True
+        # Filter out fields based on provenance and confidence toggles
+        if not config.get("include_provenance", True) and "provenance" in selected_fields:
+            selected_fields.remove("provenance")
+        if not config.get("include_confidence", True) and "overall_confidence" in selected_fields:
+            selected_fields.remove("overall_confidence")
+
+        projected = {}
+        
+        # Loop through requested fields and apply missing value strategies
+        for field in selected_fields:
+            val = flat_data.get(field)
             
-            if is_present:
-                return True, val
-            else:
+            # Determine if the value is missing/empty
+            is_missing = False
+            if val is None:
+                is_missing = True
+            elif isinstance(val, list) and len(val) == 0:
+                is_missing = True
+            elif isinstance(val, dict) and all(v is None for v in val.values()):
+                is_missing = True
+            elif isinstance(val, str) and not val.strip():
+                is_missing = True
+
+            if is_missing:
                 if missing_strategy == "error":
-                    raise ValueError(f"Required output field '{field_key}' is missing in the canonical candidate data.")
+                    raise ValueError(f"Required field '{field}' is missing in the transformation result.")
                 elif missing_strategy == "null":
-                    return True, None
-                else:
-                    return False, None
+                    projected[field] = None
+                # If 'omit', we simply do not add it to the projected output
+            else:
+                projected[field] = val
 
-        personal_info_fields = ["full_name", "headline", "emails", "phones", "location", "links"]
-        selected_p_fields = [f for f in personal_info_fields if f in selected_fields]
-        if selected_p_fields:
-            p_res = {}
-            for f in selected_p_fields:
-                val = data.get("personal_info", {}).get(f)
-                is_ok, final_val = handle_field(f, val)
-                if is_ok: p_res[f] = final_val
-            if p_res or missing_strategy == "null": res["personal_info"] = p_res
+        # Apply field renames/remaps (from config 'remap' dictionary or list of from/to dicts)
+        remap = config.get("remap", {})
+        remap_dict = {}
+        if isinstance(remap, dict):
+            remap_dict = remap
+        elif isinstance(remap, list):
+            for item in remap:
+                if isinstance(item, dict) and "from" in item and "to" in item:
+                    remap_dict[item["from"]] = item["to"]
+                    
+        final_output = {}
+        for k, v in projected.items():
+            if k in remap_dict and remap_dict[k]:
+                final_output[remap_dict[k]] = v
+            else:
+                final_output[k] = v
 
-        for f in ["skills", "experience", "education", "projects"]:
-            if f in selected_fields:
-                val = data.get(f, [])
-                is_ok, final_val = handle_field(f, val)
-                if is_ok: res[f] = final_val
-
-        if config.get("include_confidence", True):
-            res["confidence_scores"] = data.get("confidence_scores")
-
-        if config.get("include_provenance", True):
-            raw_prov = data.get("provenance", {})
-            filtered_prov = {}
-            for k, val in raw_prov.items():
-                is_selected = False
-                for sel in selected_fields:
-                    if k.startswith(f"personal_info.{sel}") or k.startswith(sel):
-                        is_selected = True
-                        break
-                if is_selected: filtered_prov[k] = val
-            res["provenance"] = filtered_prov
-
-        return res
-
-# =====================================================================
-# 9. VALIDATOR
-# =====================================================================
+        return final_output
 
 class Validator:
     @classmethod
-    def validate(cls, candidate_json: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    def validate(cls, candidate_json: Dict[str, Any], config: Dict[str, Any] = None) -> Tuple[bool, List[str]]:
+        adapted_schema = BASE_JSON_SCHEMA.copy()
+        properties = adapted_schema.get("properties", {}).copy()
+        
+        remap = (config or {}).get("remap", {})
+        remap_dict = {}
+        if isinstance(remap, dict):
+            remap_dict = remap
+        elif isinstance(remap, list):
+            for item in remap:
+                if isinstance(item, dict) and "from" in item and "to" in item:
+                    remap_dict[item["from"]] = item["to"]
+                    
+        for old_name, new_name in remap_dict.items():
+            if old_name in properties:
+                properties[new_name] = properties[old_name]
+                
+        adapted_schema["properties"] = properties
         format_checker = jsonschema.FormatChecker()
         try:
-            jsonschema.validate(instance=candidate_json, schema=BASE_JSON_SCHEMA, format_checker=format_checker)
+            # Validate against the flat schema
+            jsonschema.validate(instance=candidate_json, schema=adapted_schema, format_checker=format_checker)
             return True, []
         except jsonschema.exceptions.ValidationError as e:
             path = " -> ".join(str(p) for p in e.path) if e.path else "root"
@@ -1595,13 +2374,13 @@ class Validator:
             return False, [f"Validator engine error: {str(e)}"]
 
 # =====================================================================
-# 10. FASTAPI CONTROLLER
+# 13. FASTAPI CONTROLLER & EXPORTS
 # =====================================================================
 
 app = FastAPI(
-    title="Candidate Transformation Engine API",
-    description="Multi-Source Candidate Transformation Pipeline (Consolidated Single-File Backend)",
-    version="1.0.0"
+    title="Candidate Forge API",
+    description="Student-Themed Multi-Source Candidate Transformation Pipeline",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -1621,6 +2400,7 @@ async def transform(
     recruiter_notes: List[UploadFile] = File(default=[]),
     recruiter_notes_str: Optional[str] = Form(None),
     github_url: Optional[str] = Form(None),
+    job_description: Optional[str] = Form(None),
     config: Optional[str] = Form(None)
 ):
     start_time = time.time()
@@ -1651,12 +2431,11 @@ async def transform(
             "normalize_companies": True,
             "normalize_degrees": True,
             "missing_values": "null",
-            "selected_fields": ["full_name", "emails", "phones", "skills", "experience", "education", "projects", "links", "location", "headline"]
+            "selected_fields": ["candidate_id", "full_name", "emails", "phones", "location", "links", "headline", "years_experience", "skills", "experience", "education", "provenance", "overall_confidence"]
         }
 
-    # 2. Ingest & Read Sources
+    # 2. Ingest & Read Sources (Stage 1)
     log_stage("Reading Sources", details="Validating uploaded file formats and reading byte arrays")
-    
     all_parsed_profiles = []
     sources_processed = []
 
@@ -1735,7 +2514,7 @@ async def transform(
                 log_stage("Reading Sources", "FAILED", f"Notes parsing failed for file {file.filename}: {str(e)}")
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Notes parsing failed for file {file.filename}: {str(e)}")
 
-        # Ingest Recruiter Notes Text
+        # Ingest Recruiter Notes Text Area
         if recruiter_notes_str and recruiter_notes_str.strip():
             notes_blocks = re.split(r'\n---\n|\n\n\n', recruiter_notes_str)
             for idx, block in enumerate(notes_blocks):
@@ -1776,13 +2555,39 @@ async def transform(
             detail="Validation constraints unmet. You must provide at least one source file or URL."
         )
 
-    # 3. Parsing
+    # 3. Parsing Documents (Stage 2)
     log_stage("Parsing Documents", details=f"Successfully read {len(all_parsed_profiles)} individual candidate source profiles")
 
-    # 4. Clustering candidate profiles
-    log_stage("Creating Canonical Candidate Model", details="Clustering individual files by candidate matching names/emails/phones")
+    # 4. Creating Canonical Candidate Model (Stage 3)
+    log_stage("Creating Canonical Candidate Model", details="Mapping parsed fields into internal UniversalCandidate models")
     
-    # Disjoint-set clustering algorithm
+    # 5. Assessing Data Quality (Stage 4)
+    log_stage("Assessing Data Quality", details="Clustering individual files by candidate matching names/emails/phones")
+    
+    def clean_identity_emails(candidate: UniversalCandidate) -> set:
+        return {e.strip().lower() for e in (candidate.personal_info.emails or []) if e and "@" in e}
+
+    def clean_identity_phones(candidate: UniversalCandidate) -> set:
+        cleaned = set()
+        for phone in candidate.personal_info.phones or []:
+            digits = re.sub(r"\D", "", str(phone or ""))
+            # Require enough digits to avoid merging on partial country-code regex captures.
+            if len(digits) >= 8:
+                cleaned.add(digits[-10:] if len(digits) >= 10 else digits)
+        return cleaned
+
+    def clean_identity_name(candidate: UniversalCandidate) -> str:
+        name = re.sub(r"[^a-zA-Z\s]", " ", candidate.personal_info.full_name or "").lower()
+        name = re.sub(r"\s+", " ", name).strip()
+        weak_names = {"resume", "curriculum vitae", "profile", "candidate", "personal details"}
+        if len(name) < 3 or name in weak_names:
+            return ""
+        return name
+
+    def has_strong_identity(candidate: UniversalCandidate) -> bool:
+        return bool(clean_identity_emails(candidate) or clean_identity_phones(candidate) or clean_identity_name(candidate))
+
+    # Disjoint-set clustering algorithm to group files belonging to the same candidate
     groups = [[p] for p in all_parsed_profiles]
     changed = True
     while changed:
@@ -1794,45 +2599,50 @@ async def transform(
                 match_found = False
                 for n1, c1 in groups[i]:
                     for n2, c2 in groups[j]:
+                        if not has_strong_identity(c1) or not has_strong_identity(c2):
+                            continue
+
                         # Match by Email
-                        em1 = set(c1.personal_info.emails or [])
-                        em2 = set(c2.personal_info.emails or [])
-                        if em1 and em2 and (em1 & em2):
-                            match_found = True
-                            break
-                        # Match by Phone
-                        ph1 = set(c1.personal_info.phones or [])
-                        ph2 = set(c2.personal_info.phones or [])
-                        if ph1 and ph2 and (ph1 & ph2):
-                            match_found = True
-                            break
+                        em1 = clean_identity_emails(c1)
+                        em2 = clean_identity_emails(c2)
+                        if em1 and em2:
+                            if em1 & em2:
+                                match_found = True
+                                break
+                            continue
+
+                        # Match by credible phone number only
+                        ph1 = clean_identity_phones(c1)
+                        ph2 = clean_identity_phones(c2)
+                        if ph1 and ph2:
+                            if ph1 & ph2:
+                                match_found = True
+                                break
+                            continue
+
                         # Match by Fuzzy Name
-                        name1 = (c1.personal_info.full_name or "").strip().lower()
-                        name2 = (c2.personal_info.full_name or "").strip().lower()
+                        name1 = clean_identity_name(c1)
+                        name2 = clean_identity_name(c2)
                         if name1 and name2:
                             score = float(fuzz.token_sort_ratio(name1, name2))
-                            if score >= 85.0:
-                                # Ensure no conflicts on emails/phones
-                                has_conflict = False
-                                if em1 and em2 and not (em1 & em2): has_conflict = True
-                                if ph1 and ph2 and not (ph1 & ph2): has_conflict = True
-                                if not has_conflict:
-                                    match_found = True
-                                    break
+                            if score >= 88.0:
+                                match_found = True
+                                break
                     if match_found:
                         merge_i = i
                         merge_j = j
                         break
-                if merge_i != -1:
-                    break
+                if merge_i != -1: break
+            if merge_i != -1: break
         if merge_i != -1:
             groups[merge_i].extend(groups[merge_j])
             groups.pop(merge_j)
             changed = True
 
-    log_stage("Assessing Data Quality", details=f"Identified {len(groups)} distinct candidate(s) from uploaded sources")
+    # 6. Field Mapping (Stage 5)
+    log_stage("Field Mapping", details="Mapping source fields to canonical schema paths")
 
-    # Run the transformation pipeline for each candidate cluster!
+    # Run the transformation pipeline for each candidate cluster
     transformed_candidates = []
     
     for c_idx, group in enumerate(groups):
@@ -1840,72 +2650,104 @@ async def transform(
         for src_name, cand in group:
             cluster_sources[src_name] = cand
             
-        # 5. Normalizer
+        # 7. Normalizing Values (Stage 6)
         normalized_sources = {}
         for src_name, cand in cluster_sources.items():
             normalized_sources[src_name] = Normalizer.normalize_candidate(cand, parsed_config)
             
-        # 6. Canonicalize
+        # 8. Entity Extraction (Stage 7)
+        # Already parsed via parser, but this is the stage where we log extraction details
+        log_stage("Entity Extraction", details="Extracted names, skills, experience, and education using parsers")
+
+        # 9. RAG-based Skill Canonicalization (Stage 8)
         canonicalized_sources = {}
         for src_name, cand in normalized_sources.items():
             canonicalized_sources[src_name] = Canonicalizer.canonicalize_candidate(cand, parsed_config)
             
-        # 7. Deduplicate
+        # 10. Removing Duplicates (Stage 9)
         deduplicated_sources = {}
         for src_name, cand in canonicalized_sources.items():
             deduplicated_sources[src_name] = Deduplicator.deduplicate(cand)
             
-        # 8. Conflict Resolution
+        # 11. Resolving Conflicts (Stage 10)
         merged_candidate, conflict_logs = ConflictResolver.resolve(deduplicated_sources)
         merged_candidate = Deduplicator.deduplicate(merged_candidate)
         
-        # 9. Scorer
+        # 12. Confidence Scoring (Stage 11)
         scores, overall_conf = ConfidenceScorer.calculate(merged_candidate)
         
-        # 10. Projection & Validation
+        # Run Job Description Matcher
+        jd_match_result = None
+        if job_description:
+            jd_match_result = JDMatcher.match(merged_candidate, job_description)
+
+        trust_analysis = TrustAnalyzer.analyze(
+            merged_candidate,
+            deduplicated_sources,
+            conflict_logs,
+            jd_match_result
+        )
+        
+        # 13. Configurable Projection (Stage 12)
+        # Ensure candidate_id is set
+        if not merged_candidate.candidate_id:
+            if merged_candidate.personal_info.emails:
+                merged_candidate.candidate_id = merged_candidate.personal_info.emails[0]
+            elif merged_candidate.personal_info.full_name:
+                name_slug = re.sub(r'[^a-zA-Z0-9]', '_', merged_candidate.personal_info.full_name.lower())
+                merged_candidate.candidate_id = f"{name_slug}_{c_idx}"
+            else:
+                merged_candidate.candidate_id = f"candidate_{c_idx}"
+
         try:
             projected_json = ProjectionEngine.project(merged_candidate, parsed_config)
         except Exception as e:
-            projected_json = merged_candidate.model_dump()
+            # Catch projection errors (e.g. missing value strategy 'error')
+            log_stage("Configurable Projection", "FAILED", f"Projection failed: {str(e)}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Output Projection Constraint Violated: {str(e)}")
             
-        is_valid, validation_errors = Validator.validate(projected_json)
+        # 14. Schema Validation (Stage 13)
+        is_valid, validation_errors = Validator.validate(projected_json, parsed_config)
         validation_status = "VALID" if is_valid else "INVALID"
         
-        # Ensure candidate_id is set
-        if not projected_json.get("candidate_id"):
-            if projected_json.get("personal_info", {}).get("emails"):
-                projected_json["candidate_id"] = projected_json["personal_info"]["emails"][0]
-            elif projected_json.get("personal_info", {}).get("full_name"):
-                name_slug = re.sub(r'[^a-zA-Z0-9]', '_', projected_json["personal_info"]["full_name"].lower())
-                projected_json["candidate_id"] = f"{name_slug}_{c_idx}"
-            else:
-                projected_json["candidate_id"] = f"candidate_{c_idx}"
-                
-        # Skip empty candidate profiles that lack identifying details (full name, email, or phone)
-        p_info_obj = projected_json.get("personal_info", {})
+        # Skip empty profiles
+        p_info_obj = merged_candidate.personal_info
         has_id = (
-            (p_info_obj.get("full_name") and p_info_obj.get("full_name").strip()) or
-            p_info_obj.get("emails") or
-            p_info_obj.get("phones")
+            (p_info_obj.full_name and p_info_obj.full_name.strip()) or
+            p_info_obj.emails or
+            p_info_obj.phones
         )
-        if not has_id:
-            continue
+        if not has_id: continue
 
-        c_name = projected_json.get("personal_info", {}).get("full_name") or f"Candidate {c_idx + 1}"
+        c_name = projected_json.get("full_name") or projected_json.get("name") or f"Candidate {c_idx + 1}"
         
         transformed_candidates.append({
-            "candidate_id": projected_json["candidate_id"],
+            "candidate_id": merged_candidate.candidate_id,
             "candidate_name": c_name,
             "canonical_json": projected_json,
             "confidence": {
                 "overall_score": overall_conf,
                 "sections": scores.sections.model_dump()
             },
-            "provenance": {k: v.model_dump() for k, v in merged_candidate.provenance.items()},
+            "skills_detail": [
+                {
+                    "name": sk.name,
+                    "confidence": sk.confidence,
+                    "explanation": sk.confidence_explanation,
+                    "sources": sk.sources
+                }
+                for sk in merged_candidate.skills
+            ],
+            "provenance": [
+                {"field": p[0], "source": p[1], "method": p[2]}
+                for p in projected_json.get("provenance", [])
+            ],
             "validation": {
                 "status": validation_status,
                 "errors": validation_errors
             },
+            "trust_analysis": trust_analysis,
+            "jd_match": jd_match_result,
             "metadata": {
                 "sources_processed": list(cluster_sources.keys()),
                 "conflict_log": conflict_logs
@@ -1915,7 +2757,7 @@ async def transform(
     # Sort candidates by name
     transformed_candidates = sorted(transformed_candidates, key=lambda c: c["candidate_name"])
 
-    # 11. Complete pipeline run
+    # 15. Complete pipeline run (Generating JSON)
     log_stage("Generating JSON", details=f"Successfully built batch canonical representation for {len(transformed_candidates)} candidate(s)")
     generation_time = round((time.time() - start_time) * 1000.0, 2)
 
@@ -1929,10 +2771,301 @@ async def transform(
         }
     }
 
+# =====================================================================
+# 14. EXPORT ENDPOINTS
+# =====================================================================
+
+@app.post("/export/excel")
+def export_excel(payload: Dict[str, Any]):
+    """
+    Generates a tabular CSV file (Excel-compatible) summarizing candidate profiles.
+    """
+    candidates = payload.get("candidates", [])
+    rows = []
+    for cand in candidates:
+        json_data = cand.get("canonical_json", {})
+        
+        # Format lists for CSV
+        emails_str = ", ".join(json_data.get("emails", [])) if isinstance(json_data.get("emails"), list) else str(json_data.get("emails", ""))
+        skills_str = ", ".join([s.get("name") if isinstance(s, dict) else str(s) for s in json_data.get("skills", [])])
+        
+        # Location parsing
+        loc = json_data.get("location", {})
+        loc_str = ""
+        if isinstance(loc, dict):
+            loc_str = f"{loc.get('city') or ''}, {loc.get('region') or ''}, {loc.get('country') or ''}".strip(", ")
+        else:
+            loc_str = str(loc or "")
+
+        # Top Experience
+        exp_list = json_data.get("experience", [])
+        top_exp = ""
+        if exp_list and isinstance(exp_list, list):
+            first = exp_list[0]
+            top_exp = f"{first.get('title') or ''} at {first.get('company') or ''}"
+
+        rows.append({
+            "Candidate ID": json_data.get("candidate_id", ""),
+            "Full Name": json_data.get("full_name", ""),
+            "Emails": emails_str,
+            "Phone": json_data.get("phones", ""),
+            "Location": loc_str,
+            "Headline": json_data.get("headline", ""),
+            "Years Experience": json_data.get("years_experience", ""),
+            "Skills": skills_str,
+            "Top Experience": top_exp,
+            "Confidence Score": cand.get("confidence", {}).get("overall_score", 0.0),
+            "JD Match Score": cand.get("jd_match", {}).get("score", "N/A") if cand.get("jd_match") else "N/A"
+        })
+        
+    df = pd.DataFrame(rows)
+    stream = io.StringIO()
+    df.to_csv(stream, index=False)
+    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=candidates_summary.csv"
+    return response
+
+@app.post("/export/word")
+def export_word(payload: Dict[str, Any]):
+    """
+    Generates a styled Microsoft Word (.docx) profile report for candidates.
+    """
+    candidates = payload.get("candidates", [])
+    doc = docx.Document()
+    
+    # Title
+    doc.add_heading("Candidate Transformation System - Profile Summary", 0)
+    
+    for c_idx, cand in enumerate(candidates):
+        if c_idx > 0:
+            doc.add_page_break()
+            
+        json_data = cand.get("canonical_json", {})
+        
+        # Header
+        doc.add_heading(json_data.get("full_name") or "Unnamed Candidate", level=1)
+        doc.add_paragraph(f"Headline: {json_data.get('headline') or 'N/A'}")
+        
+        # Details Table
+        table = doc.add_table(rows=4, cols=2)
+        table.style = 'Light Shading Accent 1'
+        
+        # Row 1
+        table.rows[0].cells[0].text = "Emails"
+        emails = json_data.get("emails", [])
+        table.rows[0].cells[1].text = ", ".join(emails) if isinstance(emails, list) else str(emails or "")
+        
+        # Row 2
+        table.rows[1].cells[0].text = "Phone"
+        table.rows[1].cells[1].text = str(json_data.get("phones") or "N/A")
+        
+        # Row 3
+        table.rows[2].cells[0].text = "Confidence Score"
+        table.rows[2].cells[1].text = f"{cand.get('confidence', {}).get('overall_score', 0.0):.2f}"
+        
+        # Row 4
+        table.rows[3].cells[0].text = "JD Match Score"
+        table.rows[3].cells[1].text = f"{cand.get('jd_match', {}).get('score', 0.0)}%" if cand.get("jd_match") else "N/A"
+        
+        doc.add_paragraph() # Spacer
+        
+        # Skills
+        doc.add_heading("Skills", level=2)
+        skills = json_data.get("skills", [])
+        if skills:
+            # Add a list
+            for sk in skills:
+                name = sk.get("name") if isinstance(sk, dict) else str(sk)
+                conf = sk.get("confidence", 1.0) if isinstance(sk, dict) else 1.0
+                doc.add_paragraph(f"• {name} (Confidence: {conf:.2f})", style='List Bullet')
+        else:
+            doc.add_paragraph("No skills identified.")
+            
+        # Experience
+        doc.add_heading("Work Experience", level=2)
+        exp_list = json_data.get("experience", [])
+        if exp_list:
+            for exp in exp_list:
+                doc.add_paragraph(
+                    f"{exp.get('title') or 'Role'} at {exp.get('company') or 'Company'} "
+                    f"({exp.get('start') or 'N/A'} - {exp.get('end') or 'N/A'})",
+                    style='Heading 3'
+                )
+                if exp.get("summary"):
+                    doc.add_paragraph(exp.get("summary"))
+        else:
+            doc.add_paragraph("No experience history identified.")
+
+        # Education
+        doc.add_heading("Education", level=2)
+        edu_list = json_data.get("education", [])
+        if edu_list:
+            for edu in edu_list:
+                doc.add_paragraph(
+                    f"{edu.get('degree') or 'Degree'} in {edu.get('field') or 'Field'} "
+                    f"from {edu.get('institution') or 'Institution'} (Graduated: {edu.get('end_year') or 'N/A'})"
+                )
+        else:
+            doc.add_paragraph("No education history identified.")
+            
+    # Save doc to memory stream
+    stream = io.BytesIO()
+    doc.save(stream)
+    stream.seek(0)
+    
+    response = StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    response.headers["Content-Disposition"] = "attachment; filename=candidates_profiles.docx"
+    return response
+
+@app.post("/export/pdf")
+def export_pdf(payload: Dict[str, Any]):
+    """
+    Generates a styled, professional PDF report of the candidates using ReportLab.
+    """
+    candidates = payload.get("candidates", [])
+    stream = io.BytesIO()
+    
+    # Setup document
+    doc = SimpleDocTemplate(
+        stream, pagesize=letter,
+        rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40
+    )
+    
+    styles = getSampleStyleSheet()
+    
+    # Custom styles
+    title_style = ParagraphStyle(
+        'DocTitle', parent=styles['Heading1'],
+        fontName='Helvetica-Bold', fontSize=24, leading=28,
+        textColor=colors.HexColor("#1E3A8A"), spaceAfter=15
+    )
+    section_style = ParagraphStyle(
+        'SectionHeading', parent=styles['Heading2'],
+        fontName='Helvetica-Bold', fontSize=16, leading=20,
+        textColor=colors.HexColor("#0D9488"), spaceBefore=12, spaceAfter=8
+    )
+    body_style = ParagraphStyle(
+        'BodyTextCustom', parent=styles['Normal'],
+        fontName='Helvetica', fontSize=10, leading=14,
+        textColor=colors.HexColor("#374151")
+    )
+    bold_body_style = ParagraphStyle(
+        'BoldBodyCustom', parent=body_style,
+        fontName='Helvetica-Bold'
+    )
+    
+    story = []
+    
+    story.append(Paragraph("Candidate Transformation Summary Report", title_style))
+    story.append(Paragraph(f"Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", body_style))
+    story.append(Spacer(1, 15))
+    
+    for c_idx, cand in enumerate(candidates):
+        if c_idx > 0:
+            story.append(PageBreak())
+            
+        json_data = cand.get("canonical_json", {})
+        
+        # Candidate Header
+        name = json_data.get("full_name") or "Unnamed Candidate"
+        story.append(Paragraph(name, title_style))
+        story.append(Paragraph(f"Headline: {json_data.get('headline') or 'N/A'}", body_style))
+        story.append(Spacer(1, 10))
+        
+        # Summary Grid Table
+        emails = json_data.get("emails", [])
+        emails_str = ", ".join(emails) if isinstance(emails, list) else str(emails or "")
+        
+        data = [
+            [Paragraph("Emails:", bold_body_style), Paragraph(emails_str, body_style)],
+            [Paragraph("Phone:", bold_body_style), Paragraph(str(json_data.get("phones") or "N/A"), body_style)],
+            [Paragraph("Overall Confidence:", bold_body_style), Paragraph(f"{cand.get('confidence', {}).get('overall_score', 0.0):.2f}", body_style)],
+            [Paragraph("Job Match Score:", bold_body_style), Paragraph(f"{cand.get('jd_match', {}).get('score', 'N/A')}%" if cand.get("jd_match") else "N/A", body_style)]
+        ]
+        
+        t = Table(data, colWidths=[150, 380])
+        t.setStyle(TableStyle([
+            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+            ('BACKGROUND', (0,0), (0,-1), colors.HexColor("#F3F4F6")),
+            ('PADDING', (0,0), (-1,-1), 6),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 15))
+        
+        # Skills
+        story.append(Paragraph("Skills Profile", section_style))
+        skills = json_data.get("skills", [])
+        if skills:
+            skills_bullets = []
+            for sk in skills:
+                name_sk = sk.get("name") if isinstance(sk, dict) else str(sk)
+                conf_sk = sk.get("confidence", 1.0) if isinstance(sk, dict) else 1.0
+                skills_bullets.append(Paragraph(f"• <b>{name_sk}</b> (Confidence: {conf_sk:.2f})", body_style))
+            
+            # Format bullets into 2 columns
+            half = math.ceil(len(skills_bullets) / 2)
+            col1 = skills_bullets[:half]
+            col2 = skills_bullets[half:]
+            
+            # Fill empty cell if unequal
+            if len(col1) > len(col2):
+                col2.append(Paragraph("", body_style))
+                
+            skills_data = [[col1[i], col2[i]] for i in range(len(col1))]
+            st = Table(skills_data, colWidths=[265, 265])
+            st.setStyle(TableStyle([
+                ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ]))
+            story.append(st)
+        else:
+            story.append(Paragraph("No skills identified.", body_style))
+            
+        story.append(Spacer(1, 10))
+        
+        # Experience
+        story.append(Paragraph("Work Experience", section_style))
+        exp_list = json_data.get("experience", [])
+        if exp_list:
+            for exp in exp_list:
+                story.append(Paragraph(
+                    f"<b>{exp.get('title') or 'Role'}</b> at <b>{exp.get('company') or 'Company'}</b> "
+                    f"({exp.get('start') or 'N/A'} - {exp.get('end') or 'N/A'})",
+                    body_style
+                ))
+                if exp.get("summary"):
+                    story.append(Paragraph(exp.get("summary"), body_style))
+                story.append(Spacer(1, 5))
+        else:
+            story.append(Paragraph("No experience history identified.", body_style))
+            
+        story.append(Spacer(1, 10))
+
+        # Education
+        story.append(Paragraph("Education History", section_style))
+        edu_list = json_data.get("education", [])
+        if edu_list:
+            for edu in edu_list:
+                story.append(Paragraph(
+                    f"• <b>{edu.get('degree') or 'Degree'}</b> in {edu.get('field') or 'Field'} - "
+                    f"{edu.get('institution') or 'Institution'} (Graduated: {edu.get('end_year') or 'N/A'})",
+                    body_style
+                ))
+                story.append(Spacer(1, 4))
+        else:
+            story.append(Paragraph("No education history identified.", body_style))
+
+    doc.build(story)
+    stream.seek(0)
+    response = Response(content=stream.getvalue(), media_type="application/pdf")
+    response.headers["Content-Disposition"] = "attachment; filename=candidates_profiles.pdf"
+    return response
+
 @app.get("/health")
 def health():
     return {
         "status": "healthy",
         "timestamp": get_now_str(),
-        "version": "1.0.0"
+        "version": "2.0.0"
     }
