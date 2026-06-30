@@ -1,0 +1,110 @@
+{
+  "candidate_id": "alex.mercer@lever.io",
+  "personal_info": {
+    "full_name": "Alex Mercer",
+    "headline": "Senior Software Architect",
+    "emails": ["alex.mercer@lever.io", "alex.mercer@gmail.com"],
+    "phones": ["+14155550142"],
+    "location": "San Francisco, CA",
+    "links": [
+      "https://github.com/alex-mercer-dev",
+      "https://linkedin.com/in/alex-mercer"
+    ]
+  },
+  "skills": [
+    {
+      "name": "React",
+      "original_name": "React.js",
+      "is_canonical": true,
+      "category": "Frontend Framework",
+      "similarity_score": 100.0,
+      "confidence": 0.95
+    },
+    {
+      "name": "Node.js",
+      "original_name": "NodeJS",
+      "is_canonical": true,
+      "category": "Backend Runtime",
+      "similarity_score": 100.0,
+      "confidence": 0.95
+    },
+    {
+      "name": "TypeScript",
+      "original_name": "TypeScript",
+      "is_canonical": true,
+      "category": "Programming Language",
+      "similarity_score": 100.0,
+      "confidence": 0.95
+    },
+    {
+      "name": "Docker",
+      "original_name": "Docker",
+      "is_canonical": true,
+      "category": "DevOps",
+      "similarity_score": 100.0,
+      "confidence": 0.95
+    },
+    {
+      "name": "Python",
+      "original_name": "Python3",
+      "is_canonical": true,
+      "category": "Programming Language",
+      "similarity_score": 100.0,
+      "confidence": 0.85
+    },
+    {
+      "name": "FastAPI",
+      "original_name": "FastAPI",
+      "is_canonical": true,
+      "category": "Backend Framework",
+      "similarity_score": 100.0,
+      "confidence": 0.85
+    }
+  ],
+  "experience": [
+    {
+      "role": "Software Engineer",
+      "company": "Google LLC",
+      "location": "Mountain View, CA",
+      "start_date": "2021-06-01",
+      "end_date": "Present",
+      "description": "Architecting low-latency React and Node applications. Building APIs and microservices",
+      "duration_months": 60
+    }
+  ],
+  "education": [
+    {
+      "degree": "Bachelor of Science",
+      "institution": "Stanford University",
+      "major": "Computer Science",
+      "graduation_date": "2021-01-01"
+    }
+  ],
+  "projects": [],
+  "confidence_scores": {
+    "overall_score": 0.9,
+    "sections": {
+      "personal_info": 0.95,
+      "skills": 0.95,
+      "experience": 0.85,
+      "education": 0.9,
+      "projects": 0.0
+    }
+  },
+  "provenance": {
+    "personal_info.full_name": {
+      "source": "ats_json",
+      "method": "schema_mapping_lever_direct",
+      "confidence": 0.95,
+      "normalization_applied": null,
+      "timestamp": "2026-06-30T13:00:00Z"
+    },
+    "personal_info.emails": {
+      "source": "ats_json",
+      "method": "list_merge",
+      "confidence": 0.95,
+      "normalization_applied": null,
+      "timestamp": "2026-06-30T13:00:00Z"
+    }
+  }
+}

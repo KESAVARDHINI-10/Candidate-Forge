@@ -1,0 +1,2 @@
+candidate_name,email,phone,location,headline,links,skills,company,role,description,start_date,end_date
+Alex Mercer,alex.mercer@gmail.com,+14155550142,San Francisco,Senior Software Architect,https://github.com/alex-mercer-dev,"React, Python3, Docker, FastAPI",Google LLC,Software Engineer,Building APIs and microservices,06/2021,Present

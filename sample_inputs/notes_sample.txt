@@ -1,0 +1,10 @@
+Recruiter Interview Notes:
+Candidate: Alex Mercer
+Email: alex.mercer@lever.io
+Phone: 415-555-0142
+Alex has 5+ years of experience in JavaScript frameworks, particularly React.js and Vue.js. 
+He was a Senior Engineer at Google where he developed multiple Node microservices.
+He is very strong in backend system design with FastAPI and database scaling in PostgreSQL.
+Skills: Python, React, Vue, FastAPI, Docker, Kubernetes, AWS.
+Education: Stanford University, BS in Computer Science.
+Location: San Francisco, CA

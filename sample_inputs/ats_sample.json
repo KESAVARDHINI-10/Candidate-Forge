@@ -1,0 +1,35 @@
+{
+  "name": "Alex Mercer",
+  "email": "alex.mercer@lever.io",
+  "phones": ["+1 (415) 555-0142"],
+  "links": [
+    "https://github.com/alex-mercer-dev",
+    "https://linkedin.com/in/alex-mercer"
+  ],
+  "location": "San Francisco, CA",
+  "headline": "Senior Software Architect",
+  "skills": [
+    "React.js",
+    "NodeJS",
+    "TypeScript",
+    "Docker"
+  ],
+  "positions": [
+    {
+      "title": "Software Engineer at Google",
+      "company": "Google LLC",
+      "location": "Mountain View, CA",
+      "start": "June 2021",
+      "end": "Present",
+      "description": "Architecting low-latency React and Node applications."
+    }
+  ],
+  "schools": [
+    {
+      "degree": "B.S. in Computer Science",
+      "school": "Stanford University",
+      "fieldOfStudy": "Computer Science",
+      "end": "2021"
+    }
+  ]
+}
