@@ -1,4 +1,4 @@
-# Eightfold Candidate Transformation System
+# CandidateForge
 
 A production-quality Multi-Source Candidate Transformation System that converts multiple structured and unstructured candidate sources into a single trusted Canonical Candidate JSON profile.
 
