@@ -5,6 +5,7 @@ import time
 import datetime
 import traceback
 import math
+import zipfile
 import pandas as pd
 import fitz  # PyMuPDF
 import docx
@@ -13,6 +14,7 @@ import phonenumbers
 import httpx
 import jsonschema
 from typing import Optional, List, Dict, Any, Tuple
+from xml.sax.saxutils import escape as xml_escape
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
 from fastapi.responses import StreamingResponse, Response
@@ -2775,38 +2777,28 @@ async def transform(
 # 14. EXPORT ENDPOINTS
 # =====================================================================
 
-@app.post("/export/excel")
-def export_excel(payload: Dict[str, Any]):
-    """
-    Generates a tabular CSV file (Excel-compatible) summarizing candidate profiles.
-    """
-    candidates = payload.get("candidates", [])
+def build_export_rows(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = []
     for cand in candidates:
         json_data = cand.get("canonical_json", {})
-        
-        # Format lists for CSV
-        emails_str = ", ".join(json_data.get("emails", [])) if isinstance(json_data.get("emails"), list) else str(json_data.get("emails", ""))
-        skills_str = ", ".join([s.get("name") if isinstance(s, dict) else str(s) for s in json_data.get("skills", [])])
-        
-        # Location parsing
+        trust = cand.get("trust_analysis", {}) or {}
+        emails = json_data.get("emails", [])
+        emails_str = ", ".join(emails) if isinstance(emails, list) else str(emails or "")
+        skills = json_data.get("skills", [])
+        skills_str = ", ".join([s.get("name") if isinstance(s, dict) else str(s) for s in skills])
         loc = json_data.get("location", {})
-        loc_str = ""
         if isinstance(loc, dict):
-            loc_str = f"{loc.get('city') or ''}, {loc.get('region') or ''}, {loc.get('country') or ''}".strip(", ")
+            loc_str = ", ".join(str(v) for v in [loc.get("city"), loc.get("region"), loc.get("country")] if v)
         else:
             loc_str = str(loc or "")
-
-        # Top Experience
         exp_list = json_data.get("experience", [])
         top_exp = ""
         if exp_list and isinstance(exp_list, list):
             first = exp_list[0]
-            top_exp = f"{first.get('title') or ''} at {first.get('company') or ''}"
-
+            top_exp = f"{first.get('title') or first.get('role') or ''} at {first.get('company') or ''}".strip(" at")
         rows.append({
-            "Candidate ID": json_data.get("candidate_id", ""),
-            "Full Name": json_data.get("full_name", ""),
+            "Candidate ID": cand.get("candidate_id") or json_data.get("candidate_id", ""),
+            "Full Name": json_data.get("full_name", cand.get("candidate_name", "")),
             "Emails": emails_str,
             "Phone": json_data.get("phones", ""),
             "Location": loc_str,
@@ -2815,16 +2807,88 @@ def export_excel(payload: Dict[str, Any]):
             "Skills": skills_str,
             "Top Experience": top_exp,
             "Confidence Score": cand.get("confidence", {}).get("overall_score", 0.0),
+            "Trust Score": trust.get("overall_trust_score", ""),
+            "Match Score": trust.get("overall_match_score", ""),
+            "Recommendation": trust.get("recommendation", ""),
+            "Most Reliable Source": trust.get("most_reliable_source", ""),
+            "Conflict Ratio": (trust.get("ratios") or {}).get("conflict_ratio", ""),
+            "Missing Ratio": (trust.get("ratios") or {}).get("missing_information_ratio", ""),
             "JD Match Score": cand.get("jd_match", {}).get("score", "N/A") if cand.get("jd_match") else "N/A"
         })
-        
+    return rows
+
+
+def dataframe_csv_response(rows: List[Dict[str, Any]], filename: str):
     df = pd.DataFrame(rows)
     stream = io.StringIO()
     df.to_csv(stream, index=False)
     response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
-    response.headers["Content-Disposition"] = "attachment; filename=candidates_summary.csv"
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
     return response
 
+
+def build_xlsx(rows: List[Dict[str, Any]]) -> bytes:
+    headers = list(rows[0].keys()) if rows else ["Message"]
+    data_rows = rows if rows else [{"Message": "No candidates available"}]
+
+    def col_name(index: int) -> str:
+        name = ""
+        while index:
+            index, rem = divmod(index - 1, 26)
+            name = chr(65 + rem) + name
+        return name
+
+    def cell(ref: str, value: Any) -> str:
+        value = "" if value is None else str(value)
+        return f'<c r="{ref}" t="inlineStr"><is><t>{xml_escape(value)}</t></is></c>'
+
+    sheet_rows = []
+    sheet_rows.append('<row r="1">' + ''.join(cell(f"{col_name(i + 1)}1", h) for i, h in enumerate(headers)) + '</row>')
+    for row_idx, row in enumerate(data_rows, start=2):
+        sheet_rows.append('<row r="{0}">{1}</row>'.format(
+            row_idx,
+            ''.join(cell(f"{col_name(col_idx + 1)}{row_idx}", row.get(header, "")) for col_idx, header in enumerate(headers))
+        ))
+    worksheet = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{''.join(sheet_rows)}</sheetData></worksheet>'''
+    workbook = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Candidates" sheetId="1" r:id="rId1"/></sheets></workbook>'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'''
+    workbook_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'''
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'''
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/worksheets/sheet1.xml", worksheet)
+    return stream.getvalue()
+
+
+@app.post("/export/json")
+def export_json(payload: Dict[str, Any]):
+    content = json.dumps(payload, indent=2, ensure_ascii=False)
+    response = Response(content=content, media_type="application/json")
+    response.headers["Content-Disposition"] = "attachment; filename=candidates_full_result.json"
+    return response
+
+
+@app.post("/export/csv")
+def export_csv(payload: Dict[str, Any]):
+    return dataframe_csv_response(build_export_rows(payload.get("candidates", [])), "candidates_summary.csv")
+
+
+@app.post("/export/excel")
+def export_excel(payload: Dict[str, Any]):
+    rows = build_export_rows(payload.get("candidates", []))
+    content = build_xlsx(rows)
+    response = Response(content=content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    response.headers["Content-Disposition"] = "attachment; filename=candidates_summary.xlsx"
+    return response
 @app.post("/export/word")
 def export_word(payload: Dict[str, Any]):
     """

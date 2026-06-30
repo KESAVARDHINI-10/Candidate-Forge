@@ -364,6 +364,26 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const downloadExport = async (format) => {
+    if (!transformResult) return;
+    const configByFormat = {
+      json: { endpoint: '/export/json', filename: 'candidates_full_result.json', mime: 'application/json' },
+      pdf: { endpoint: '/export/pdf', filename: 'candidates_profiles.pdf', mime: 'application/pdf' },
+      csv: { endpoint: '/export/csv', filename: 'candidates_summary.csv', mime: 'text/csv' },
+      excel: { endpoint: '/export/excel', filename: 'candidates_summary.xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+    };
+    const exportConfig = configByFormat[format];
+    if (!exportConfig) return;
+    const response = await axios.post(`${API_BASE}${exportConfig.endpoint}`, transformResult, { responseType: 'blob' });
+    const blob = new Blob([response.data], { type: exportConfig.mime });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = exportConfig.filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const asArray = (value) => {
     if (Array.isArray(value)) return value.filter(Boolean);
     return value ? [value] : [];
@@ -439,6 +459,29 @@ export default function App() {
   const trustSections = Object.entries(selectedTrust?.section_scores || {});
   const formatPercent = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
   const formatLabel = (value) => String(value || '').replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  const sectionFormulaText = (data) => {
+    const reliability = Number(data?.source_reliability) || 0;
+    const agreement = Number(data?.source_agreement_ratio) || 0;
+    const freshness = Number(data?.freshness_score) || 0;
+    const completeness = Number(data?.completeness_ratio) || 0;
+    const semantic = Number(data?.semantic_match_quality) || 0;
+    const score = reliability * 0.35 + agreement * 0.25 + freshness * 0.15 + completeness * 0.15 + semantic * 0.10;
+    return `Formula: (${formatPercent(reliability)} x 35%) + (${formatPercent(agreement)} x 25%) + (${formatPercent(freshness)} x 15%) + (${formatPercent(completeness)} x 15%) + (${formatPercent(semantic)} x 10%) = ${formatPercent(score)}.`;
+  };
+  const trustFormulaText = selectedTrust
+    ? `Formula: sum(section score x section weight). Current trust = ${formatPercent(selectedTrust.overall_trust_score)}. Section weights: skills 25%, experience 25%, education 15%, projects 15%, contact 10%, links/profile 10%.`
+    : '';
+  const matchFormulaText = selectedTrust
+    ? `Formula: (Trust ${formatPercent(selectedTrust.overall_trust_score)} x 70%) + (JD/fit score x 30%). If no JD is provided, trust is reused for the fit component. Current match = ${formatPercent(selectedTrust.overall_match_score)}.`
+    : '';
+  const FormulaHint = ({ text }) => (
+    <span className="relative inline-flex group align-middle ml-1">
+      <Info size={12} className="text-blue-400 cursor-help" />
+      <span className="pointer-events-none absolute z-50 hidden group-hover:block right-0 top-5 w-72 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-[11px] leading-4 text-gray-200 shadow-xl font-mono normal-case tracking-normal">
+        {text}
+      </span>
+    </span>
+  );
   const renderHighlightedJson = () => {
     if (!transformResult || !transformResult.candidates[selectedCandidateIndex]) return null;
     const json = transformResult.candidates[selectedCandidateIndex].canonical_json;
@@ -1223,7 +1266,7 @@ export default function App() {
                 <div className="flex items-center gap-6 min-w-[220px]">
                   <div className="flex-1 space-y-1.5">
                     <div className="flex justify-between text-xs font-mono">
-                      <span className="text-gray-450">Match Quality</span>
+                      <span className="text-gray-450 inline-flex items-center">Match Quality <FormulaHint text={matchFormulaText || "Overall profile confidence from section scores."} /></span>
                       <span className="font-bold text-blue-400">
                         {Math.round(transformResult.candidates[selectedCandidateIndex].confidence.overall_score * 100)}%
                       </span>
@@ -1275,11 +1318,11 @@ export default function App() {
 
                   <div className="grid grid-cols-3 gap-3 min-w-full lg:min-w-[390px]">
                     <div className="border border-slate-800 rounded-card p-3 bg-slate-950/30">
-                      <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold">Trust</div>
+                      <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold inline-flex items-center">Trust <FormulaHint text={trustFormulaText} /></div>
                       <div className="text-2xl font-black text-blue-400 font-mono mt-1">{formatPercent(selectedTrust.overall_trust_score)}</div>
                     </div>
                     <div className="border border-slate-800 rounded-card p-3 bg-slate-950/30">
-                      <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold">Match</div>
+                      <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold inline-flex items-center">Match <FormulaHint text={matchFormulaText} /></div>
                       <div className="text-2xl font-black text-emerald-400 font-mono mt-1">{formatPercent(selectedTrust.overall_match_score)}</div>
                     </div>
                     <div className="border border-slate-800 rounded-card p-3 bg-slate-950/30">
@@ -1302,7 +1345,7 @@ export default function App() {
                         <div key={section} className="border border-slate-800 rounded-card p-4 bg-slate-950/25 space-y-3">
                           <div className="flex items-center justify-between gap-3">
                             <span className="text-sm font-bold">{formatLabel(section)}</span>
-                            <span className="font-mono text-blue-400 font-bold">{formatPercent(data.score)}</span>
+                            <span className="font-mono text-blue-400 font-bold inline-flex items-center">{formatPercent(data.score)} <FormulaHint text={sectionFormulaText(data)} /></span>
                           </div>
                           <div className="w-full bg-slate-800 rounded-full h-1.5">
                             <div className="h-1.5 rounded-full bg-blue-500" style={{ width: formatPercent(data.score) }} />
@@ -1510,6 +1553,26 @@ export default function App() {
               </button>
             </div>
 
+            <div className="flex flex-wrap items-center justify-between gap-3 border border-slate-800 rounded-card bg-[#121826] px-4 py-3 select-none">
+              <div>
+                <div className="text-sm font-bold text-gray-100">Download Result</div>
+                <div className="text-[11px] text-gray-500 font-mono">JSON, PDF, CSV, and Excel exports include candidate scores and trust analysis.</div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={() => downloadExport('json')} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-gray-200 transition-all">
+                  <Download size={14} /> JSON
+                </button>
+                <button type="button" onClick={() => downloadExport('pdf')} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-gray-200 transition-all">
+                  <Download size={14} /> PDF
+                </button>
+                <button type="button" onClick={() => downloadExport('csv')} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-gray-200 transition-all">
+                  <Download size={14} /> CSV
+                </button>
+                <button type="button" onClick={() => downloadExport('excel')} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition-all">
+                  <Download size={14} /> Excel
+                </button>
+              </div>
+            </div>
             {/* 6.2 High-Fidelity JSON Code Viewer */}
             {resultViewMode === 'json' && (
               <div className={`border rounded-card overflow-hidden flex flex-col ${
